@@ -1,0 +1,14 @@
+streamlit_app.py
+import streamlit as st
+
+st.title("📊 Trading Dashboard")
+
+st.write("Mijn trading dashboard is live 🔥")
+Commit new file
+requirements.txt
+streamlit
+pandas
+numpy
+requests
+
+

@@ -1,0 +1,4 @@
+import streamlit as st
+
+st.title("📊 Trading Dashboard")
+st.write("Mijn trading dashboard is live 🔥")

@@ -737,14 +737,7 @@ def capital_login(base: str, api_key: str, identifier: str, password: str, timeo
     cst = r.headers.get("CST")
     xst = r.headers.get("X-SECURITY-TOKEN")
 
-    try:
-        body = r.json()
-    except Exception:
-        body = {"raw": r.text}
-
-    if r.status_code >= 200 and r.status_code < 300 and cst and xst:
-        return True, {"status": r.status_code, "body": body, "cst": cst, "x_security_token": xst}
-   else:
+  else:
     return False, {
         "status": r.status_code,
         "body": body,

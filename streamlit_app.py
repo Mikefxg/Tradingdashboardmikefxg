@@ -1,207 +1,337 @@
+import time
+from dataclasses import dataclass
+from typing import Optional, Dict, Tuple
+
 import streamlit as st
-from datetime import datetime, timezone
-from tradingview_ta import TA_Handler, Interval
+
+# TradingView TA library (reads TradingView technicals, not broker API)
+from tradingview_ta import TA_Handler, Interval, Exchange, TradingView
 
 # -----------------------------
-# SETTINGS
+# CONFIG
 # -----------------------------
-st.set_page_config(page_title="Market Sentiment Dashboard", layout="wide")
+st.set_page_config(page_title="Market Sentiment (TradingView x Capital.com)", layout="wide")
 
 REFRESH_MINUTES = 10
-INTERVAL = Interval.INTERVAL_15_MINUTES  # good balance with 10-min refresh
+INTERVAL = Interval.INTERVAL_15_MINUTES  # 15m is a good balance for intraday bias
 
-# Primary: FOREXCOM (TradingView broker feed)
-# Fallback: TVC / OANDA if a symbol isn't available on FOREXCOM in TradingView TA
-MARKETS = [
-    ("Nasdaq 100", "NAS100", "FOREXCOM", "america", [("TVC", "america", "NDX")]),
-    ("S&P 500",    "SPX500", "FOREXCOM", "america", [("TVC", "america", "SPX")]),
-    ("US30",       "US30",   "FOREXCOM", "america", [("TVC", "america", "DJI")]),
-    ("XAUUSD",     "XAUUSD", "FOREXCOM", "forex",   [("OANDA", "forex", "XAUUSD")]),
-    ("EURUSD",     "EURUSD", "FOREXCOM", "forex",   [("OANDA", "forex", "EURUSD")]),
-    ("DXY",        "DXY",    "FOREXCOM", "america", [("FOREXCOM", "america", "USDOLLAR"), ("TVC", "america", "DXY")]),
-]
+# IMPORTANT:
+# You MUST set these to the exact TradingView tickers you see (Exchange:Symbol).
+# Examples (may differ!):
+#   "CAPITALCOM:US100" or "CAPITALCOM:NAS100"
+#   "CAPITALCOM:US500" or "CAPITALCOM:SPX500"
+# If a symbol fails: open TradingView, search the instrument, copy the exact ticker.
+
+MARKETS = {
+    "US100 (Nasdaq CFD)": "CAPITALCOM:US100",
+    "US500 (S&P CFD)": "CAPITALCOM:US500",
+    "US30 (Dow CFD)": "CAPITALCOM:US30",
+    "XAUUSD (Gold Spot)": "CAPITALCOM:XAUUSD",
+    "EURUSD": "CAPITALCOM:EURUSD",
+    # DXY often not available on broker feeds; keep Capitalcom first and fallback to TVC:DXY
+    "DXY (Dollar Index)": "CAPITALCOM:DXY|TVC:DXY",
+}
 
 # -----------------------------
 # HELPERS
 # -----------------------------
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
+@dataclass
+class Outlook:
+    label: str            # BULLISH / BEARISH / NEUTRAL
+    bias: str             # BUY BIAS / SELL BIAS / WAIT
+    score: float
+    details: Dict[str, float]
+    tv_recommendation: str
+    last: Optional[float]
+    error: Optional[str] = None
 
-def safe_float(x):
+
+def parse_tv_ticker(ticker: str) -> Tuple[str, str]:
+    """Split EXCHANGE:SYMBOL"""
+    if ":" not in ticker:
+        # If user gave only symbol, assume CAPITALCOM (best guess)
+        return "CAPITALCOM", ticker
+    ex, sym = ticker.split(":", 1)
+    return ex.strip().upper(), sym.strip().upper()
+
+
+def get_ta(exchange: str, symbol: str) -> Tuple[Optional[dict], Optional[str]]:
     try:
+        handler = TA_Handler(
+            symbol=symbol,
+            exchange=exchange,
+            screener="forex",  # works for most; TradingView still resolves based on exchange
+            interval=INTERVAL,
+            timeout=10,
+        )
+        analysis = handler.get_analysis()
+        return {
+            "summary": analysis.summary,
+            "indicators": analysis.indicators,
+        }, None
+    except Exception as e:
+        return None, str(e)
+
+
+def safe_float(x) -> Optional[float]:
+    try:
+        if x is None:
+            return None
         return float(x)
     except Exception:
         return None
 
-@st.cache_data(ttl=REFRESH_MINUTES * 60, show_spinner=False)
-def fetch_ta(symbol: str, exchange: str, screener: str, interval: Interval):
-    handler = TA_Handler(symbol=symbol, exchange=exchange, screener=screener, interval=interval)
-    return handler.get_analysis()
 
-def get_analysis_with_fallback(symbol, exchange, screener, interval, fallbacks):
-    # Try primary
-    try:
-        a = fetch_ta(symbol, exchange, screener, interval)
-        return a, (exchange, symbol)
-    except Exception:
-        pass
+def compute_outlook(ta: dict) -> Outlook:
+    ind = ta["indicators"]
+    summ = ta["summary"] or {}
+    tv_rec = (summ.get("RECOMMENDATION") or "NEUTRAL").upper()
 
-    # Try fallbacks
-    for ex, sc, sym in fallbacks:
-        try:
-            a = fetch_ta(sym, ex, sc, interval)
-            return a, (ex, sym)
-        except Exception:
-            continue
-
-    raise RuntimeError("No working feed found for this market on configured exchanges.")
-
-def sentiment_from_indicators(ind):
-    """
-    Sentiment op basis van chart movement:
-    - Trend: close vs SMA50
-    - Structure: SMA20 vs SMA50
-    - Momentum: RSI
-    - MACD histogram sign
-    """
+    rsi = safe_float(ind.get("RSI"))
+    adx = safe_float(ind.get("ADX"))
+    macd = safe_float(ind.get("MACD.macd"))
+    macd_signal = safe_float(ind.get("MACD.signal"))
     close = safe_float(ind.get("close"))
+
     sma20 = safe_float(ind.get("SMA20"))
     sma50 = safe_float(ind.get("SMA50"))
-    rsi   = safe_float(ind.get("RSI"))
-    macd  = safe_float(ind.get("MACD.macd"))
-    macds = safe_float(ind.get("MACD.signal"))
+    ema20 = safe_float(ind.get("EMA20"))
+    ema50 = safe_float(ind.get("EMA50"))
 
-    if close is None:
-        return {
-            "label": "NEUTRAL",
-            "score": 0.0,
-            "bias": "WAIT",
-            "why": ["No close price available from feed."],
-            "metrics": {}
-        }
-
+    # Score components (simple + robust)
     score = 0.0
-    why = []
+    details = {}
 
-    # Trend vs SMA50
-    if sma50 is not None:
-        if close > sma50:
-            score += 0.9
-            why.append("Price above SMA50 (trend up).")
+    # Trend via moving averages
+    trend_score = 0.0
+    if close and sma20 and sma50:
+        if close > sma20 > sma50:
+            trend_score += 0.8
+        elif close < sma20 < sma50:
+            trend_score -= 0.8
+        elif close > sma50:
+            trend_score += 0.3
         elif close < sma50:
-            score -= 0.9
-            why.append("Price below SMA50 (trend down).")
+            trend_score -= 0.3
 
-    # Structure: SMA20 vs SMA50
-    if sma20 is not None and sma50 is not None:
-        if sma20 > sma50:
-            score += 0.6
-            why.append("SMA20 above SMA50 (bull structure).")
-        elif sma20 < sma50:
-            score -= 0.6
-            why.append("SMA20 below SMA50 (bear structure).")
+    # fallback to EMA if SMA missing
+    if trend_score == 0.0 and close and ema20 and ema50:
+        if close > ema20 > ema50:
+            trend_score += 0.7
+        elif close < ema20 < ema50:
+            trend_score -= 0.7
 
-    # Momentum: RSI
+    details["trend"] = trend_score
+    score += trend_score
+
+    # RSI momentum
+    rsi_score = 0.0
     if rsi is not None:
-        if rsi >= 58:
-            score += 0.5
-            why.append(f"RSI {rsi:.1f} bullish momentum.")
-        elif rsi <= 42:
-            score -= 0.5
-            why.append(f"RSI {rsi:.1f} bearish momentum.")
+        if rsi >= 60:
+            rsi_score += 0.4
+        elif rsi <= 40:
+            rsi_score -= 0.4
         else:
-            why.append(f"RSI {rsi:.1f} neutral zone.")
+            rsi_score += 0.0
+    details["rsi"] = rsi_score
+    score += rsi_score
 
     # MACD histogram sign
-    if macd is not None and macds is not None:
-        hist = macd - macds
+    macd_score = 0.0
+    if macd is not None and macd_signal is not None:
+        hist = macd - macd_signal
         if hist > 0:
-            score += 0.4
-            why.append("MACD histogram positive.")
+            macd_score += 0.35
         elif hist < 0:
-            score -= 0.4
-            why.append("MACD histogram negative.")
+            macd_score -= 0.35
+    details["macd"] = macd_score
+    score += macd_score
 
-    score = clamp(score, -2.0, 2.0)
+    # ADX = strength multiplier (not direction)
+    strength = 1.0
+    if adx is not None:
+        if adx >= 25:
+            strength = 1.15
+        elif adx <= 15:
+            strength = 0.85
+    details["strength_mult"] = strength
 
-    if score >= 0.75:
+    score *= strength
+
+    # Nudge score using TradingView recommendation
+    tv_nudge = 0.0
+    if "STRONG_BUY" in tv_rec or tv_rec == "BUY":
+        tv_nudge = 0.25
+    elif "STRONG_SELL" in tv_rec or tv_rec == "SELL":
+        tv_nudge = -0.25
+    details["tv_nudge"] = tv_nudge
+    score += tv_nudge
+
+    # Final label
+    if score >= 0.55:
         label = "BULLISH"
         bias = "BUY BIAS"
-    elif score <= -0.75:
+    elif score <= -0.55:
         label = "BEARISH"
         bias = "SELL BIAS"
     else:
         label = "NEUTRAL"
-        bias = "WAIT / RANGE"
+        bias = "WAIT / NO CLEAR EDGE"
 
-    metrics = {
-        "close": close,
-        "SMA20": sma20,
-        "SMA50": sma50,
-        "RSI": rsi,
-        "MACD_hist": (macd - macds) if (macd is not None and macds is not None) else None,
-    }
+    return Outlook(
+        label=label,
+        bias=bias,
+        score=round(score, 2),
+        details={
+            "RSI": round(rsi, 1) if rsi is not None else None,
+            "ADX": round(adx, 1) if adx is not None else None,
+            "SMA20": round(sma20, 5) if sma20 is not None else None,
+            "SMA50": round(sma50, 5) if sma50 is not None else None,
+            "Last": round(close, 5) if close is not None else None,
+        },
+        tv_recommendation=tv_rec,
+        last=close,
+    )
 
-    return {"label": label, "score": score, "bias": bias, "why": why, "metrics": metrics}
 
-def icon(label: str):
-    return "🟢" if label == "BULLISH" else ("🔴" if label == "BEARISH" else "⚪️")
+def tv_widget(symbol: str, title: str):
+    # TradingView embedded chart (works if symbol string is correct)
+    # symbol must be like "CAPITALCOM:US100"
+    return f"""
+    <div class="tradingview-widget-container" style="height:420px;">
+      <div id="tv_{title.replace(" ", "_")}" style="height:420px;"></div>
+      <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+      <script type="text/javascript">
+        new TradingView.widget({{
+          "width": "100%",
+          "height": 420,
+          "symbol": "{symbol}",
+          "interval": "15",
+          "timezone": "Etc/UTC",
+          "theme": "light",
+          "style": "1",
+          "locale": "en",
+          "toolbar_bg": "#f1f3f6",
+          "enable_publishing": false,
+          "allow_symbol_change": true,
+          "hide_side_toolbar": false,
+          "details": true,
+          "container_id": "tv_{title.replace(" ", "_")}"
+        }});
+      </script>
+    </div>
+    """
+
+
+@st.cache_data(ttl=REFRESH_MINUTES * 60)
+def load_market_outlooks() -> Dict[str, Outlook]:
+    results: Dict[str, Outlook] = {}
+
+    for name, ticker in MARKETS.items():
+        # support fallback like "CAPITALCOM:DXY|TVC:DXY"
+        candidates = [t.strip() for t in ticker.split("|") if t.strip()]
+        last_err = None
+        ta_data = None
+
+        for cand in candidates:
+            ex, sym = parse_tv_ticker(cand)
+            data, err = get_ta(ex, sym)
+            if data:
+                ta_data = data
+                last_err = None
+                # store which symbol succeeded
+                results[name] = compute_outlook(ta_data)
+                results[name].details["Feed"] = cand
+                break
+            last_err = err
+
+        if ta_data is None:
+            results[name] = Outlook(
+                label="—",
+                bias="—",
+                score=0.0,
+                details={"Feed": candidates[0] if candidates else ticker},
+                tv_recommendation="—",
+                last=None,
+                error=f"No working feed. Last error: {last_err}",
+            )
+
+    return results
+
+
+def pill(label: str):
+    if label == "BULLISH":
+        st.markdown("🟢 **BULLISH**")
+    elif label == "BEARISH":
+        st.markdown("🔴 **BEARISH**")
+    elif label == "NEUTRAL":
+        st.markdown("⚪ **NEUTRAL**")
+    else:
+        st.markdown("⚠️ **FEED ERROR**")
+
 
 # -----------------------------
 # UI
 # -----------------------------
-st.title("📈 Market Sentiment (TradingView × FOREXCOM)")
-st.caption(f"Refresh elke {REFRESH_MINUTES} min • Interval: 15m • Feed: FOREXCOM (fallbacks actief)")
+st.title("📈 Market Sentiment (TradingView × Capital.com)")
+st.caption(f"Refresh elke {REFRESH_MINUTES} min • Interval: 15m • Charts: TradingView widget • Score: MA + RSI + MACD + ADX + TV rec")
 
-# Auto-refresh
-st.markdown(
-    f"""
-    <script>
-    setTimeout(function(){{
-        window.location.reload();
-    }}, {REFRESH_MINUTES * 60 * 1000});
-    </script>
-    """,
-    unsafe_allow_html=True
-)
+outlooks = load_market_outlooks()
 
-cols = st.columns(6)
-
-for idx, (name, symbol, ex, scr, fallbacks) in enumerate(MARKETS):
-    with cols[idx]:
-        st.subheader(name)
-
-        try:
-            analysis, used = get_analysis_with_fallback(symbol, ex, scr, INTERVAL, fallbacks)
-            ind = analysis.indicators or {}
-            rec = analysis.summary.get("RECOMMENDATION") if analysis.summary else None
-
-            s = sentiment_from_indicators(ind)
-
-            st.markdown(f"### {icon(s['label'])} {s['label']}")
-            st.metric("Bias", s["bias"], f"score {s['score']:+.2f}")
-
-            m = s["metrics"]
-            if m.get("close") is not None:
-                st.write(f"**Last:** `{m['close']}`")
-            if m.get("RSI") is not None:
-                st.write(f"**RSI:** `{m['RSI']:.1f}`")
-            if m.get("SMA20") is not None and m.get("SMA50") is not None:
-                st.write(f"**SMA20/SMA50:** `{m['SMA20']:.2f}` / `{m['SMA50']:.2f}`")
-            if m.get("MACD_hist") is not None:
-                st.write(f"**MACD hist:** `{m['MACD_hist']:+.4f}`")
-
-            if rec:
-                st.caption(f"TradingView TA: **{rec}** • feed: `{used[0]}:{used[1]}`")
-
-            with st.expander("Waarom deze score?"):
-                for line in s["why"]:
-                    st.write("• " + line)
-
-        except Exception as e:
+# Summary row
+cols = st.columns(len(MARKETS))
+for (name, _), col in zip(MARKETS.items(), cols):
+    o = outlooks[name]
+    with col:
+        st.subheader(name.split(" (")[0])
+        if o.error:
             st.error("Feed error")
-            st.caption(str(e))
+            st.caption(o.error)
+            st.caption(f"Feed: {o.details.get('Feed')}")
+        else:
+            pill(o.label)
+            st.markdown(f"**{o.bias}**")
+            st.metric("Score", f"{o.score:+.2f}")
+            st.caption(f"TV: {o.tv_recommendation} • Last: {o.last}")
 
 st.divider()
-now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-st.caption(f"Last refresh: {now}")
+
+# Charts + details
+st.subheader("Charts & details")
+
+# Show 2 rows of charts
+names = list(MARKETS.keys())
+row1 = names[:3]
+row2 = names[3:]
+
+for row in (row1, row2):
+    c = st.columns(len(row))
+    for name, col in zip(row, c):
+        ticker = MARKETS[name].split("|")[0].strip()  # chart uses primary symbol
+        with col:
+            st.markdown(f"### {name}")
+            st.components.v1.html(tv_widget(ticker, name), height=460)
+            o = outlooks[name]
+            if o.error:
+                st.warning(o.error)
+            else:
+                st.write(
+                    {
+                        "Outlook": o.label,
+                        "Bias": o.bias,
+                        "Score": o.score,
+                        "TV Rec": o.tv_recommendation,
+                        "Last": o.last,
+                        "RSI": o.details.get("RSI"),
+                        "ADX": o.details.get("ADX"),
+                        "SMA20": o.details.get("SMA20"),
+                        "SMA50": o.details.get("SMA50"),
+                        "Feed used": o.details.get("Feed"),
+                    }
+                )
+
+st.info(
+    "Tip: Als je 'Feed error' krijgt bij US100/US500/US30/XAUUSD/EURUSD, "
+    "dan klopt de ticker niet. Open TradingView → zoek instrument → kopieer exact 'EXCHANGE:SYMBOL' "
+    "(bv. CAPITALCOM:US100 of CAPITALCOM:NAS100) en vervang bovenaan in MARKETS."
+)

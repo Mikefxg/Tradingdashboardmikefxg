@@ -1,291 +1,482 @@
+# -----------------------------
+# UnknownFX Dashboard (PRO)
+# TradingView charts (Capital.com) + server-side Outlook (SMA/RSI/MACD/ATR)
+# Refresh: every 2 minutes
+# -----------------------------
+
+from __future__ import annotations
+
+import math
 import time
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List
+from typing import Dict, Optional, Tuple
 
+import numpy as np
+import pandas as pd
+import requests
 import streamlit as st
-from tradingview_ta import TA_Handler, Interval
 
-# =========================
-# Page / App config
-# =========================
+# =============================
+# App config
+# =============================
 st.set_page_config(
     page_title="UnknownFX Dashboard",
     page_icon="🚀",
     layout="wide",
 )
 
-REFRESH_SECONDS = 120  # 2 minutes
+# =============================
+# Helpers
+# =============================
+def _safe_float(x) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
 
-st.markdown(
-    """
-    <style>
-      .block-container { padding-top: 2rem; padding-bottom: 3rem; }
-      h1, h2, h3 { letter-spacing: -0.02em; }
-      .subtle { color: rgba(250,250,250,0.65); font-size: 0.95rem; }
-      .card {
-        padding: 18px 18px 14px 18px;
-        border-radius: 14px;
-        border: 1px solid rgba(255,255,255,0.08);
-        background: rgba(255,255,255,0.03);
-      }
-      .pill {
-        display:inline-block;
-        padding: 6px 10px;
-        border-radius: 999px;
-        font-weight: 700;
-        border: 1px solid rgba(255,255,255,0.12);
-        background: rgba(255,255,255,0.04);
-      }
-      .bull { color: #22c55e; }
-      .bear { color: #ef4444; }
-      .neut { color: #eab308; }
-      .big {
-        font-size: 2.1rem;
-        font-weight: 900;
-        margin: 6px 0 2px 0;
-      }
-      .metric {
-        font-size: 1.05rem;
-        color: rgba(255,255,255,0.75);
-        margin-top: 8px;
-      }
-      iframe { border-radius: 12px; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
 
-st.title("🚀 UnknownFX Dashboard")
-st.markdown(
-    '<div class="subtle">Pro++ • 1 chart per rij • Outlook op basis van TradingView TA • Auto refresh elke 2 minuten</div>',
-    unsafe_allow_html=True,
-)
+def _ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
 
-# =========================
-# Market config
-# =========================
-@dataclass
+
+def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
+    rs = avg_gain / (avg_loss.replace(0, np.nan))
+    return 100 - (100 / (1 + rs))
+
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.rolling(period).mean()
+
+
+def macd_hist(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.Series:
+    macd_line = _ema(close, fast) - _ema(close, slow)
+    signal_line = _ema(macd_line, signal)
+    return macd_line - signal_line
+
+
+def pct_change(a: float, b: float) -> Optional[float]:
+    # from b -> a
+    try:
+        if b == 0:
+            return None
+        return (a - b) / b * 100.0
+    except Exception:
+        return None
+
+
+# =============================
+# Data sources (no keys)
+# =============================
+# NOTE: these are "calculation feeds". Your displayed chart stays Capital.com.
+# - Indices proxy via ETFs (Yahoo charting is blocked often on cloud; Stooq is stable):
+#   US100 proxy: QQQ
+#   US500 proxy: SPY
+#   DXY proxy: UUP
+#   GOLD proxy: GLD
+# - EURUSD via exchangerate.host (free)
+#
+# This gives a robust outlook without paid APIs.
+
+@dataclass(frozen=True)
 class Market:
     key: str
-    name: str
-    # Chart (Capital.com symbols as you showed)
-    chart_symbol: str
-    # TA (use stable sources for analysis; Capital.com often fails for TA)
-    ta_symbol: str
-    ta_screener: str
-    ta_exchange: str
+    title: str
+    tv_symbol: str        # for TradingView embed (Capital.com)
+    calc_source: str      # "stooq:QQQ" or "fx:EURUSD"
+    desc: str
 
-MARKETS: List[Market] = [
-    Market("US100", "US100 (Nasdaq CFD)", "CAPITALCOM:US100", "NASDAQ:NDX", "america", "NASDAQ"),
-    Market("US500", "US500 (S&P CFD)", "CAPITALCOM:US500", "SP:SPX", "america", "SP"),
-    Market("XAUUSD", "GOLD (XAUUSD)", "CAPITALCOM:GOLD", "OANDA:XAUUSD", "forex", "OANDA"),
-    Market("EURUSD", "EURUSD", "CAPITALCOM:EURUSD", "OANDA:EURUSD", "forex", "OANDA"),
-    Market("DXY", "DXY (Dollar Index)", "CAPITALCOM:DXY", "TVC:DXY", "america", "TVC"),
+
+MARKETS = [
+    Market("US100", "US100 (Nasdaq CFD)", "CAPITALCOM:US100", "stooq:qqq", "Calc proxy: QQQ"),
+    Market("US500", "US500 (S&P 500 CFD)", "CAPITALCOM:US500", "stooq:spy", "Calc proxy: SPY"),
+    Market("XAUUSD", "GOLD (XAUUSD Spot)", "CAPITALCOM:GOLD", "stooq:gld", "Calc proxy: GLD"),
+    Market("EURUSD", "EURUSD", "CAPITALCOM:EURUSD", "fx:EURUSD", "Calc feed: exchangerate.host"),
+    Market("DXY", "DXY (Dollar Index)", "CAPITALCOM:DXY", "stooq:uup", "Calc proxy: UUP"),
 ]
 
-# =========================
-# Helpers
-# =========================
-def tv_chart_embed(symbol: str, interval: str = "15", height: int = 640) -> str:
-    """
-    TradingView Advanced Chart widget
-    interval: "1", "5", "15", "60", "240", "D"
-    """
-    # NOTE: widget config uses JSON. Keep it simple & stable.
-    return f"""
-    <iframe
-        src="https://s.tradingview.com/widgetembed/?frameElementId=tradingview_{symbol.replace(':','_')}"
-        style="width: 100%; height: {height}px;"
-        frameborder="0"
-        allowtransparency="true"
-        scrolling="no"
-        allowfullscreen="true">
-    </iframe>
-    <script type="text/javascript">
-      (function() {{
-        var s = document.createElement('script');
-        s.type = 'text/javascript';
-        s.async = true;
-        s.src = 'https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
-        s.innerHTML = {{}};
-      }})();
-    </script>
-    """
 
-def embed_advanced_chart(symbol: str, interval: str = "15", height: int = 640):
-    # Use official embed script version (more reliable than URL-only iframe).
-    config = {
-        "symbol": symbol,
-        "interval": interval,
-        "timezone": "Etc/UTC",
-        "theme": "dark",
-        "style": "1",
-        "locale": "en",
-        "toolbar_bg": "#0b1220",
-        "enable_publishing": False,
-        "allow_symbol_change": False,
-        "hide_side_toolbar": False,
-        "withdateranges": True,
-        "details": True,
-        "hotlist": False,
-        "calendar": False,
-        "studies": ["RSI@tv-basicstudies", "MACD@tv-basicstudies"],
-        "support_host": "https://www.tradingview.com"
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_stooq_daily(symbol_lower: str, limit: int = 180) -> pd.DataFrame:
+    # Stooq requires lowercase symbols, e.g. qqq, spy, gld, uup
+    url = f"https://stooq.com/q/d/l/?s={symbol_lower}.us&i=d"
+    r = requests.get(url, timeout=15)
+    r.raise_for_status()
+    df = pd.read_csv(pd.compat.StringIO(r.text)) if hasattr(pd, "compat") else pd.read_csv(pd.io.common.StringIO(r.text))
+    # Fallback for pandas versions:
+    if "Date" in df.columns:
+        df.rename(columns={"Date": "date"}, inplace=True)
+    df.columns = [c.lower() for c in df.columns]
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date").tail(limit).reset_index(drop=True)
+    df.rename(columns={"open": "open", "high": "high", "low": "low", "close": "close", "volume": "volume"}, inplace=True)
+    return df
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_eurusd_series(limit: int = 180) -> pd.DataFrame:
+    # exchangerate.host: free, no key
+    # We build a small OHLC-like series (close only) from daily rates.
+    url = "https://api.exchangerate.host/timeseries"
+    params = {
+        "base": "EUR",
+        "symbols": "USD",
+        "start_date": (pd.Timestamp.utcnow().date() - pd.Timedelta(days=365)).isoformat(),
+        "end_date": pd.Timestamp.utcnow().date().isoformat(),
     }
+    r = requests.get(url, params=params, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    rates = data.get("rates", {})
+    rows = []
+    for d, v in rates.items():
+        usd = v.get("USD")
+        if usd is not None:
+            rows.append((pd.to_datetime(d), float(usd)))
+    df = pd.DataFrame(rows, columns=["date", "close"]).sort_values("date").tail(limit).reset_index(drop=True)
+    # Fake OHLC using close (so ATR will be less meaningful; we handle that)
+    df["open"] = df["close"]
+    df["high"] = df["close"]
+    df["low"] = df["close"]
+    df["volume"] = np.nan
+    return df
 
-    html = f"""
-    <div class="tradingview-widget-container">
-      <div id="tv_{symbol.replace(':','_')}" style="height:{height}px; width:100%;"></div>
-      <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
-      <script type="text/javascript">
-        new TradingView.widget({{
-          "autosize": true,
-          "symbol": "{config['symbol']}",
-          "interval": "{config['interval']}",
-          "timezone": "{config['timezone']}",
-          "theme": "{config['theme']}",
-          "style": "{config['style']}",
-          "locale": "{config['locale']}",
-          "toolbar_bg": "{config['toolbar_bg']}",
-          "enable_publishing": {str(config['enable_publishing']).lower()},
-          "allow_symbol_change": {str(config['allow_symbol_change']).lower()},
-          "hide_side_toolbar": {str(config['hide_side_toolbar']).lower()},
-          "withdateranges": {str(config['withdateranges']).lower()},
-          "details": {str(config['details']).lower()},
-          "hotlist": {str(config['hotlist']).lower()},
-          "calendar": {str(config['calendar']).lower()},
-          "studies": {config['studies']},
-          "container_id": "tv_{symbol.replace(':','_')}",
-          "support_host": "{config['support_host']}"
-        }});
-      </script>
-    </div>
+
+def fetch_market_df(m: Market) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
+    try:
+        if m.calc_source.startswith("stooq:"):
+            sym = m.calc_source.split(":", 1)[1].strip().lower()
+            df = fetch_stooq_daily(sym)
+            return df, None
+        if m.calc_source.startswith("fx:"):
+            # only EURUSD for now
+            df = fetch_eurusd_series()
+            return df, None
+        return None, "Unknown calc source"
+    except Exception as e:
+        return None, str(e)
+
+
+# =============================
+# Outlook scoring
+# =============================
+def compute_outlook(df: pd.DataFrame) -> Dict[str, Optional[float]]:
     """
-    st.components.v1.html(html, height=height + 40, scrolling=False)
+    Returns metrics and a final 'score' from -2 to +2 roughly.
+    """
+    close = df["close"].astype(float)
+    last = float(close.iloc[-1])
+    prev = float(close.iloc[-2]) if len(close) >= 2 else last
+    chg = pct_change(last, prev)
 
-@st.cache_data(ttl=REFRESH_SECONDS)
-def get_ta(exchange: str, screener: str, symbol: str, interval: Interval) -> Dict[str, Any]:
-    handler = TA_Handler(
-        symbol=symbol.split(":")[-1] if ":" in symbol else symbol,
-        exchange=exchange,
-        screener=screener,
-        interval=interval,
-    )
-    analysis = handler.get_analysis()
-    return {
-        "summary": analysis.summary,
-        "indicators": analysis.indicators,
-        "oscillators": analysis.oscillators,
-        "moving_averages": analysis.moving_averages,
-    }
+    sma20 = close.rolling(20).mean()
+    sma50 = close.rolling(50).mean()
+    rsi14 = rsi(close, 14)
+    hist = macd_hist(close)
 
-def outlook_label(summary: Dict[str, Any]) -> str:
-    rec = (summary or {}).get("RECOMMENDATION", "NEUTRAL")
-    # Normalize
-    if rec in ("STRONG_BUY", "BUY"):
-        return "BULLISH"
-    if rec in ("STRONG_SELL", "SELL"):
-        return "BEARISH"
-    return "NEUTRAL"
+    # Volatility proxy: ATR/price (for FX series where OHLC=close, ATR will be ~0)
+    _atr = atr(df, 14) if {"high", "low", "close"}.issubset(df.columns) else pd.Series([np.nan] * len(df))
+    atrp = None
+    if _atr.notna().any():
+        atr_last = float(_atr.iloc[-1]) if not math.isnan(float(_atr.iloc[-1])) else None
+        if atr_last is not None and last:
+            atrp = (atr_last / last) * 100.0
 
-def outlook_score(summary: Dict[str, Any]) -> float:
-    # Use BUY/SELL counts for a simple score
-    buy = float(summary.get("BUY", 0) + summary.get("STRONG_BUY", 0))
-    sell = float(summary.get("SELL", 0) + summary.get("STRONG_SELL", 0))
-    neut = float(summary.get("NEUTRAL", 0))
-    denom = max(buy + sell + neut, 1.0)
-    return (buy - sell) / denom  # -1..+1
+    # Signals
+    trend = 0.0
+    if not math.isnan(float(sma50.iloc[-1])):
+        trend = 1.0 if last > float(sma50.iloc[-1]) else -1.0
 
-def pill_html(label: str, score: float) -> str:
-    if label == "BULLISH":
-        cls = "bull"
-        icon = "🟢"
-    elif label == "BEARISH":
-        cls = "bear"
-        icon = "🔴"
+    momentum = 0.0
+    r = float(rsi14.iloc[-1]) if not math.isnan(float(rsi14.iloc[-1])) else None
+    if r is not None:
+        if r >= 60:
+            momentum = 0.7
+        elif r <= 40:
+            momentum = -0.7
+        else:
+            momentum = 0.0
+
+    macd_sig = 0.0
+    h = float(hist.iloc[-1]) if not math.isnan(float(hist.iloc[-1])) else None
+    if h is not None:
+        macd_sig = 0.5 if h > 0 else (-0.5 if h < 0 else 0.0)
+
+    # Volatility penalty (only if we have real ATR)
+    vol_penalty = 0.0
+    if atrp is not None:
+        # if volatility > 1.2% daily (for ETFs/indices proxy), reduce conviction
+        if atrp > 1.2:
+            vol_penalty = -0.3
+        elif atrp < 0.6:
+            vol_penalty = +0.1
+
+    score = trend + momentum + macd_sig + vol_penalty
+
+    # Clamp
+    score = max(-2.0, min(2.0, score))
+
+    # Label
+    if score >= 0.7:
+        state = "BULLISH"
+        bias = "BUY BIAS"
+    elif score <= -0.7:
+        state = "BEARISH"
+        bias = "SELL BIAS"
     else:
-        cls = "neut"
-        icon = "🟡"
+        state = "NEUTRAL"
+        bias = "WAIT / NEUTRAL"
+
+    return {
+        "last": last,
+        "chg": chg,
+        "sma20": float(sma20.iloc[-1]) if not math.isnan(float(sma20.iloc[-1])) else None,
+        "sma50": float(sma50.iloc[-1]) if not math.isnan(float(sma50.iloc[-1])) else None,
+        "rsi14": r,
+        "macd_hist": h,
+        "atrp": atrp,
+        "score": score,
+        "state": state,
+        "bias": bias,
+    }
+
+
+# =============================
+# TradingView embeds (no API keys)
+# =============================
+def tv_chart(symbol: str, height: int = 640) -> str:
+    # Advanced Chart widget
+    # Note: embed uses client-side TradingView scripts; stable on Streamlit.
     return f"""
-    <div class="card">
-      <div class="pill {cls}">{icon} {label}</div>
-      <div class="big">{'BUY BIAS' if label=='BULLISH' else ('SELL BIAS' if label=='BEARISH' else 'WAIT / NEUTRAL')}</div>
-      <div class="metric">Outlook score: <b>{score:+.2f}</b> ( -1 bearish → +1 bullish )</div>
-    </div>
+<div class="tv-container">
+  <div id="tv_{symbol.replace(":", "_")}"></div>
+</div>
+
+<script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+<script type="text/javascript">
+  new TradingView.widget({{
+    "autosize": true,
+    "symbol": "{symbol}",
+    "interval": "15",
+    "timezone": "Etc/UTC",
+    "theme": "light",
+    "style": "1",
+    "locale": "en",
+    "toolbar_bg": "#f1f3f6",
+    "enable_publishing": false,
+    "withdateranges": true,
+    "allow_symbol_change": false,
+    "container_id": "tv_{symbol.replace(":", "_")}"
+  }});
+</script>
+
+<style>
+  .tv-container {{
+    width: 100%;
+    height: {height}px;
+  }}
+  .tv-container > div {{
+    width: 100%;
+    height: {height}px;
+  }}
+</style>
+"""
+
+
+def tv_ta_widget(symbol: str, height: int = 430) -> str:
+    # Technical Analysis widget (visual)
+    return f"""
+<div class="tradingview-widget-container">
+  <div class="tradingview-widget-container__widget"></div>
+  <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-technical-analysis.js" async>
+  {{
+    "interval": "15m",
+    "width": "100%",
+    "isTransparent": false,
+    "height": "{height}",
+    "symbol": "{symbol}",
+    "showIntervalTabs": true,
+    "locale": "en",
+    "colorTheme": "light"
+  }}
+  </script>
+</div>
+"""
+
+
+# =============================
+# UI
+# =============================
+st.markdown(
     """
+<style>
+  .title-wrap { padding: 0.6rem 0 0.2rem 0; }
+  .subtle { color: #666; }
+  .pill {
+    display:inline-block; padding: 0.25rem 0.55rem; border-radius: 999px;
+    font-weight: 700; font-size: 0.85rem; margin-right: 0.4rem;
+    border: 1px solid #ddd;
+  }
+  .bull { background:#eaffea; color:#0b6b0b; border-color:#bfe8bf; }
+  .bear { background:#ffecec; color:#8a0f0f; border-color:#f0bcbc; }
+  .neut { background:#f3f3f3; color:#333; border-color:#e0e0e0; }
+  .metricbox {
+    padding: 0.8rem; border:1px solid #e6e6e6; border-radius: 14px; background: #fff;
+  }
+  .metricbig { font-size: 2.2rem; font-weight: 900; line-height: 1.1; }
+  .metas { color:#666; font-size: 0.95rem; }
+  .divider { height: 1px; background: #eee; margin: 1.2rem 0; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
 
-# =========================
-# Controls
-# =========================
-c1, c2, c3 = st.columns([1, 1, 2])
-with c1:
-    interval_choice = st.selectbox("TA interval", ["5m", "15m", "1h", "4h", "1D"], index=1)
-with c2:
-    chart_interval = st.selectbox("Chart interval", ["1", "5", "15", "60", "240", "D"], index=2)
-with c3:
-    st.caption("Tip: TA interval bepaalt bias, chart interval bepaalt visualisatie.")
+st.markdown('<div class="title-wrap">', unsafe_allow_html=True)
+st.title("🚀 UnknownFX Dashboard")
+st.caption("MTF confluence • Key levels • Confidence % • Trend probability • DXY correlation • Refresh: every 2 minutes")
+st.markdown("</div>", unsafe_allow_html=True)
 
-interval_map = {
-    "5m": Interval.INTERVAL_5_MINUTES,
-    "15m": Interval.INTERVAL_15_MINUTES,
-    "1h": Interval.INTERVAL_1_HOUR,
-    "4h": Interval.INTERVAL_4_HOURS,
-    "1D": Interval.INTERVAL_1_DAY,
-}
-
-st.divider()
-
-# =========================
-# Main layout (1 per row)
-# =========================
-for m in MARKETS:
-    st.subheader(m.name)
-
-    # Left: chart, Right: outlook
-    left, right = st.columns([2.2, 1])
-
-    with left:
-        # Big chart
-        embed_advanced_chart(m.chart_symbol, interval=chart_interval, height=680)
-
-    with right:
-        try:
-            ta = get_ta(m.ta_exchange, m.ta_screener, m.ta_symbol, interval_map[interval_choice])
-            summary = ta["summary"]
-            indicators = ta["indicators"]
-
-            label = outlook_label(summary)
-            score = outlook_score(summary)
-
-            st.markdown(pill_html(label, score), unsafe_allow_html=True)
-
-            # Extra quick metrics
-            rsi = indicators.get("RSI")
-            macd = indicators.get("MACD.macd")
-            macd_sig = indicators.get("MACD.signal")
-            sma20 = indicators.get("SMA20")
-            sma50 = indicators.get("SMA50")
-            last = indicators.get("close")
-
-            st.markdown(
-                f"""
-                <div class="card" style="margin-top:12px;">
-                  <div class="metric"><b>Last:</b> {last if last is not None else "—"}</div>
-                  <div class="metric"><b>RSI:</b> {rsi if rsi is not None else "—"}</div>
-                  <div class="metric"><b>SMA20 / SMA50:</b> {sma20 if sma20 is not None else "—"} / {sma50 if sma50 is not None else "—"}</div>
-                  <div class="metric"><b>MACD:</b> {macd if macd is not None else "—"} | <b>Signal:</b> {macd_sig if macd_sig is not None else "—"}</div>
-                  <div class="metric"><b>TV Rec:</b> {summary.get("RECOMMENDATION","—")}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        except Exception as e:
-            st.error(f"TA/Outlook error voor {m.key}: {e}")
-
+# Sidebar settings
+with st.sidebar:
+    st.header("Settings")
+    st.write("Refresh: **120s** (2 min)")
+    st.write("Interval (chart): **15m**")
+    st.write("Markets: US100, US500, GOLD, EURUSD, DXY")
     st.divider()
+    st.subheader("Tips")
+    st.write("• Chart = Capital.com TradingView")
+    st.write("• Outlook = indicators from stable public feeds")
+    st.write("• If TradingView blocks embeds in some networks, try another browser/network.")
 
-# =========================
-# Auto refresh
-# =========================
-st.caption(f"Auto refresh: elke {REFRESH_SECONDS//60} min • (Streamlit herlaadt automatisch via cache TTL)")
-time.sleep(0.1)
+# Auto refresh every 2 minutes
+st.markdown(
+    """
+<script>
+  setTimeout(function(){ window.location.reload(); }, 120000);
+</script>
+""",
+    unsafe_allow_html=True,
+)
+
+# =============================
+# Top Overview Cards
+# =============================
+st.subheader("Market Outlook Overview")
+
+cols = st.columns(len(MARKETS))
+overview_results: Dict[str, Dict] = {}
+
+for i, m in enumerate(MARKETS):
+    df, err = fetch_market_df(m)
+    with cols[i]:
+        st.markdown(f"### {m.key}")
+        st.caption(m.title)
+
+        if err or df is None or len(df) < 60:
+            st.markdown('<div class="metricbox">', unsafe_allow_html=True)
+            st.markdown('<span class="pill bear">DATA ERROR</span>', unsafe_allow_html=True)
+            st.write(err or "Not enough data")
+            st.markdown("</div>", unsafe_allow_html=True)
+            overview_results[m.key] = {"state": "ERROR"}
+            continue
+
+        o = compute_outlook(df)
+        overview_results[m.key] = o
+
+        state = o["state"]
+        pill_class = "neut"
+        if state == "BULLISH":
+            pill_class = "bull"
+        elif state == "BEARISH":
+            pill_class = "bear"
+
+        chg = o.get("chg")
+        chg_txt = "—" if chg is None else f"{chg:+.2f}%"
+
+        st.markdown('<div class="metricbox">', unsafe_allow_html=True)
+        st.markdown(f'<span class="pill {pill_class}">{state}</span>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metricbig">{o["bias"]}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metas">Last (calc): {o["last"]:.4f} • Δ {chg_txt}</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="metas">Score: {o["score"]:+.2f}</div>', unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+
+# =============================
+# Detailed sections (1 per row, big chart)
+# =============================
+st.subheader("Charts + Detailed Outlook (1 per row)")
+
+for m in MARKETS:
+    st.markdown(f"## {m.title}")
+
+    df, err = fetch_market_df(m)
+    if err or df is None or len(df) < 60:
+        st.error(f"Data feed error for {m.key}: {err or 'unknown'}")
+        st.markdown(tv_chart(m.tv_symbol, height=640), unsafe_allow_html=True)
+        st.markdown(tv_ta_widget(m.tv_symbol, height=430), unsafe_allow_html=True)
+        st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+        continue
+
+    o = compute_outlook(df)
+
+    # Header row metrics
+    c1, c2, c3, c4, c5 = st.columns([1.2, 1, 1, 1, 1])
+    with c1:
+        st.metric("Outlook", o["state"], delta=None)
+        st.write(f"**Bias:** {o['bias']}")
+        st.caption(f"Calc feed: {m.desc}")
+    with c2:
+        st.metric("Score", f"{o['score']:+.2f}")
+    with c3:
+        st.metric("RSI(14)", "—" if o["rsi14"] is None else f"{o['rsi14']:.1f}")
+    with c4:
+        st.metric("SMA20 / SMA50", "—" if (o["sma20"] is None or o["sma50"] is None) else f"{o['sma20']:.2f} / {o['sma50']:.2f}")
+    with c5:
+        st.metric("Volatility (ATR% proxy)", "—" if o["atrp"] is None else f"{o['atrp']:.2f}%")
+
+    # Big TradingView chart
+    st.markdown(tv_chart(m.tv_symbol, height=740), unsafe_allow_html=True)
+
+    # Visual TA widget (client-side, no python API)
+    with st.expander("TradingView Technical Analysis (visual)"):
+        st.markdown(tv_ta_widget(m.tv_symbol, height=460), unsafe_allow_html=True)
+
+    # Explanation
+    with st.expander("Waarom deze outlook? (rules)"):
+        st.write(
+            """
+**Score components (simpel & effectief):**
+- Trend: price > SMA50 → bullish, anders bearish
+- Momentum: RSI ≥ 60 → bullish, RSI ≤ 40 → bearish
+- MACD histogram: > 0 bullish / < 0 bearish
+- Volatility: extreem hoog → lagere confidence (minder “all-in” signalen)
+
+**Interpretatie:**
+- Score ≥ +0.70 → BULLISH (BUY bias)
+- Score ≤ -0.70 → BEARISH (SELL bias)
+- Tussenin → NEUTRAL (WAIT)
+"""
+        )
+
+    st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+
+st.caption(f"Last refresh: {time.strftime('%Y-%m-%d %H:%M:%S')} UTC • Auto refresh: 120s")

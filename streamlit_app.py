@@ -70,8 +70,8 @@ MARKETS: List[Market] = [
     Market("US100", "US Tech 100", "CAPITALCOM:USTECH100", "bv. 'USTECH100' EPIC van Capital"),
     Market("US500", "US 500",      "CAPITALCOM:US500",     "bv. 'US500' EPIC van Capital"),
     Market("GOLD",  "Gold (XAUUSD)","CAPITALCOM:GOLD",     "bv. 'GOLD' / 'XAUUSD' EPIC van Capital"),
-    Market("EURUSD","EURUSD",      "CAPITALCOM:EURUSD",   "bv. 'EURUSD' EPIC van Capital"),
-    Market("DXY",   "DXY",         "CAPITALCOM:DXY",      "bv. 'DXY' EPIC van Capital"),
+    Market("EURUSD","EURUSD",      "CAPITALCOM:EURUSD",    "bv. 'EURUSD' EPIC van Capital"),
+    Market("DXY",   "DXY",         "CAPITALCOM:DXY",       "bv. 'DXY' EPIC van Capital"),
 ]
 
 
@@ -144,7 +144,11 @@ def load_epics() -> Dict[str, str]:
         with open(EPICS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
-            return {k: str(v) for k, v in data.items()}
+            # ensure all keys exist
+            out = {m.key: "" for m in MARKETS}
+            for k, v in data.items():
+                out[str(k)] = str(v)
+            return out
     except Exception:
         pass
     return {m.key: "" for m in MARKETS}
@@ -155,8 +159,7 @@ def save_epics(epics: Dict[str, str]) -> None:
         with open(EPICS_FILE, "w", encoding="utf-8") as f:
             json.dump(epics, f, indent=2)
     except Exception:
-        # On Streamlit Cloud, writing is usually fine inside repo runtime.
-        # If it fails, we still keep it in session_state.
+        # If filesystem write fails, we still keep it in session_state.
         pass
 
 
@@ -173,7 +176,6 @@ def is_admin() -> bool:
         st.session_state["is_admin"] = False
 
     if not st.session_state["is_admin"]:
-        # Minimal login (appears ONLY if sidebar still visible; we’ll hide sidebar after this block)
         with st.sidebar:
             st.markdown("### 🔒 Admin login")
             pw = st.text_input("Password", type="password")
@@ -353,7 +355,7 @@ def fetch_candles(epic: str, timeframe_key: str, max_points: int = 300) -> Tuple
         c = p.get("closePrice", {})
         h = p.get("highPrice", {})
         l = p.get("lowPrice", {})
-        # Prefer bid/ask mid if available, else fallback
+
         def mid(x):
             if x is None:
                 return None
@@ -378,7 +380,6 @@ def fetch_candles(epic: str, timeframe_key: str, max_points: int = 300) -> Tuple
         )
 
     df = pd.DataFrame(rows)
-    # Parse time
     df["time"] = pd.to_datetime(df["time"], errors="coerce", utc=True)
     df = df.dropna(subset=["time"]).sort_values("time")
     df = df.dropna(subset=["close"])
@@ -387,6 +388,9 @@ def fetch_candles(epic: str, timeframe_key: str, max_points: int = 300) -> Tuple
     return True, df
 
 
+# =========================
+# Indicators + Market Sentiment
+# =========================
 def compute_rsi(close: pd.Series, period: int = 14) -> float:
     if len(close) < period + 2:
         return float("nan")
@@ -420,11 +424,47 @@ def compute_atr_pct(df: pd.DataFrame, period: int = 14) -> float:
     return float((atr / last) * 100.0)
 
 
+def market_sentiment(df: pd.DataFrame) -> str:
+    """
+    Simple, stable institutional-style sentiment:
+    - +1 if last close > previous close (momentum)
+    - +1 if RSI > 55
+    - -1 if RSI < 45
+    score >= 2 => BULLISH
+    score <= -2 => BEARISH
+    else NEUTRAL
+    """
+    if df is None or len(df) < 20:
+        return "NEUTRAL"
+
+    close = df["close"]
+    last = float(close.iloc[-1])
+    prev = float(close.iloc[-2]) if len(close) > 1 else last
+    rsi = compute_rsi(close, 14)
+
+    score = 0
+    # price momentum
+    score += 1 if last > prev else -1
+
+    # rsi momentum
+    if pd.notna(rsi):
+        if rsi > 55:
+            score += 1
+        elif rsi < 45:
+            score -= 1
+
+    if score >= 2:
+        return "BULLISH"
+    if score <= -2:
+        return "BEARISH"
+    return "NEUTRAL"
+
+
 # =========================
 # TradingView embed (BIGGER)
 # =========================
-def tradingview_embed(symbol: str, interval: str, height: int = 760) -> None:
-    # Bigger chart: 760px default
+def tradingview_embed(symbol: str, interval: str, height: int = 900) -> None:
+    # Bigger chart: 900px default
     html = f"""
 <div class="tv-wrap">
   <div class="tradingview-widget-container">
@@ -462,7 +502,6 @@ def tradingview_embed(symbol: str, interval: str, height: int = 760) -> None:
 # Auto refresh (NO external module)
 # =========================
 def meta_refresh(seconds: int) -> None:
-    # Works as full page refresh; lightweight and no extra packages.
     if seconds <= 0:
         return
     st.markdown(
@@ -479,7 +518,7 @@ st.markdown(
 <div class="ufx-header">
   <div>
     <div class="ufx-title">🚀 UnknownFX Dashboard</div>
-    <div class="ufx-sub">Institutional view · Capital.com candles · TradingView charts · EPIC mapping · Public/Private mode</div>
+    <div class="ufx-sub">Institutional view · Capital.com candles · TradingView charts · Bull/Bear/Neutral · Public/Private mode</div>
   </div>
   <div class="ufx-badge">PRO+++</div>
 </div>
@@ -495,6 +534,7 @@ st.write("")
 # =========================
 if "epics" not in st.session_state:
     st.session_state["epics"] = load_epics()
+
 
 # =========================
 # Sidebar (ADMIN ONLY)
@@ -528,7 +568,6 @@ if ADMIN:
                     st.session_state.pop("capital_login_cooldown_until", None)
                     st.success("Session cleared.")
 
-            # Show token status (minimal)
             token = st.session_state.get("capital_token")
             if token:
                 age = int(time.time() - float(token.get("ts", 0)))
@@ -538,7 +577,7 @@ if ADMIN:
 
         st.markdown("---")
         st.markdown("## 🧭 EPIC map (1x instellen)")
-        st.caption("Plak jouw EPICs hier (van Capital). Je hebt ze gevonden via 'Use this EPIC'.")
+        st.caption("Plak jouw EPICs hier (van Capital).")
 
         for m in MARKETS:
             val = st.text_input(
@@ -560,14 +599,13 @@ if ADMIN:
                 save_epics(st.session_state["epics"])
                 st.warning("EPICs cleared.")
 
-        st.caption("Tip: krijg je 429 → je logt te vaak in. Zet refresh hoger (10+ min).")
+        st.caption("Tip: krijg je 429 → refresh hoger (10+ min) en niet spam klikken.")
 
 
 # =========================
 # Public mode defaults (no sidebar)
 # =========================
 if not ADMIN:
-    # Public visitors: fixed defaults
     auto_refresh_on = True
     refresh_min = 10
     chart_tf = "15m"
@@ -594,7 +632,7 @@ with top_left:
 
 with top_right:
     tf = st.selectbox("Timeframe", options=list(TV_INTERVALS.keys()), index=list(TV_INTERVALS.keys()).index(chart_tf))
-    st.caption("Capital candles volgen dezelfde timeframe waar mogelijk.")
+    st.caption("Sentiment komt uit Capital candles (RSI + momentum).")
 
 
 market = next(m for m in MARKETS if m.key == market_key)
@@ -604,14 +642,15 @@ cap_tf = tf if tf in CAP_RES else "15m"
 
 
 # =========================
-# Data fetch + KPI cards
+# Data fetch + KPI cards + Sentiment
 # =========================
-kpi1, kpi2, kpi3, kpi4 = st.columns([1.1, 1.1, 1.1, 1.7], gap="large")
+kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns([1.0, 1.0, 1.0, 1.0, 1.3], gap="large")
 
 price_text = "—"
 chg_text = "—"
 rsi_text = "—"
 atr_text = "—"
+sentiment = "NEUTRAL"
 status_text = ""
 
 df = None
@@ -626,6 +665,8 @@ if epic:
         rsi = compute_rsi(df["close"], 14)
         atrp = compute_atr_pct(df, 14)
 
+        sentiment = market_sentiment(df)
+
         price_text = f"{last:,.2f}"
         chg_text = f"{chg:+.2f}%"
         rsi_text = f"{rsi:.1f}" if pd.notna(rsi) else "—"
@@ -637,32 +678,54 @@ else:
     status_text = "EPIC ontbreekt voor deze market (admin: vul EPIC map in)."
 
 with kpi1:
-    st.markdown('<div class="card"><div class="card-title">Price (Capital)</div>'
-                f'<div class="card-value">{price_text}</div>'
-                f'<div class="card-sub">{market.label}</div></div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="card"><div class="card-title">Price (Capital)</div>'
+        f'<div class="card-value">{price_text}</div>'
+        f'<div class="card-sub">{market.label}</div></div>',
+        unsafe_allow_html=True,
+    )
 
 with kpi2:
-    st.markdown('<div class="card"><div class="card-title">Change</div>'
-                f'<div class="card-value">{chg_text}</div>'
-                f'<div class="card-sub">Last candle vs prev</div></div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="card"><div class="card-title">Change</div>'
+        f'<div class="card-value">{chg_text}</div>'
+        f'<div class="card-sub">Last candle vs prev</div></div>',
+        unsafe_allow_html=True,
+    )
 
 with kpi3:
-    st.markdown('<div class="card"><div class="card-title">RSI (14)</div>'
-                f'<div class="card-value">{rsi_text}</div>'
-                f'<div class="card-sub">Momentum</div></div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="card"><div class="card-title">RSI (14)</div>'
+        f'<div class="card-value">{rsi_text}</div>'
+        f'<div class="card-sub">Momentum</div></div>',
+        unsafe_allow_html=True,
+    )
 
 with kpi4:
-    st.markdown('<div class="card"><div class="card-title">Volatility (ATR%)</div>'
-                f'<div class="card-value">{atr_text}</div>'
-                f'<div class="card-sub">{status_text}</div></div>', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="card"><div class="card-title">Volatility (ATR%)</div>'
+        f'<div class="card-value">{atr_text}</div>'
+        f'<div class="card-sub">{status_text}</div></div>',
+        unsafe_allow_html=True,
+    )
+
+with kpi5:
+    # Big clear sentiment indicator
+    if sentiment == "BULLISH":
+        st.success("🟢 BULLISH")
+    elif sentiment == "BEARISH":
+        st.error("🔴 BEARISH")
+    else:
+        st.warning("🟡 NEUTRAL")
+    st.caption("Bias: price momentum + RSI (55/45 zones).")
 
 st.write("")
 
 
 # =========================
-# Big Chart (TradingView) — BIGGER
+# Big Chart (TradingView) — even bigger
 # =========================
-tradingview_embed(symbol=market.tv_symbol, interval=tv_interval, height=820)
+tradingview_embed(symbol=market.tv_symbol, interval=tv_interval, height=980)
 
 
 # =========================
@@ -673,7 +736,7 @@ if ADMIN:
         if df is None:
             st.warning("No DF available (missing epic or error).")
         else:
-            st.dataframe(df.tail(50), use_container_width=True)
+            st.dataframe(df.tail(80), use_container_width=True)
 
 
 # =========================
@@ -681,5 +744,5 @@ if ADMIN:
 # =========================
 st.caption(
     "Public mode: sidebar hidden. Admin mode: open with `?admin=1` and login (ADMIN_PASSWORD). "
-    "EPICs are stored in epics.json + session_state."
+    "EPICs stored in epics.json + session_state."
 )

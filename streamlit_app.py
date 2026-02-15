@@ -1,100 +1,269 @@
 from __future__ import annotations
 
-import io
-import math
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import requests
 import streamlit as st
-
-# =========================================================
-# CONFIG
-# =========================================================
-APP_TITLE = "🚀 UnknownFX Dashboard — PRO++"
-DEFAULT_REFRESH_SEC = 120  # 2 minutes
-
-st.set_page_config(page_title="UnknownFX Dashboard", page_icon="🚀", layout="wide")
+import streamlit.components.v1 as components
 
 
-# =========================================================
-# UI STYLE
-# =========================================================
-st.markdown(
-    """
-<style>
-  .subtle { color:#6b6b6b; }
-  .pill{
-    display:inline-block; padding:0.28rem 0.62rem; border-radius:999px;
-    font-weight:800; font-size:0.85rem; border:1px solid #e6e6e6; margin-right:.4rem;
-  }
-  .bull{ background:#eaffea; color:#0b6b0b; border-color:#bfe8bf; }
-  .bear{ background:#ffecec; color:#8a0f0f; border-color:#f0bcbc; }
-  .neut{ background:#f3f3f3; color:#333; border-color:#e0e0e0; }
-  .warn{ background:#fff6d7; color:#7a5b00; border-color:#ffe08a; }
-
-  .card{
-    padding:0.9rem; border:1px solid #eaeaea; border-radius:16px; background:#fff;
-  }
-  .big{ font-size:2.1rem; font-weight:900; line-height:1.05; }
-  .mid{ font-size:1.05rem; font-weight:700; }
-  .meta{ color:#666; font-size:0.95rem; }
-  .divider{ height:1px; background:#efefef; margin:1.2rem 0; }
-
-  .tvwrap{ width:100%; border:1px solid #ededed; border-radius:16px; overflow:hidden; }
-</style>
-""",
-    unsafe_allow_html=True,
+# =========================
+# Page + Theme (PRO+++)
+# =========================
+st.set_page_config(
+    page_title="UnknownFX Dashboard",
+    page_icon="🚀",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
+PRO_CSS = """
+<style>
+:root{
+  --bg:#0B1220;
+  --panel:#0F1A2B;
+  --panel2:#0C1626;
+  --text:#EAF0FF;
+  --muted:#9FB0D0;
+  --border:rgba(255,255,255,.08);
+  --good:#22C55E;
+  --bad:#EF4444;
+  --warn:#F59E0B;
+  --blue:#60A5FA;
+  --chip:#111C2E;
+}
+html, body, [class*="css"]  { background: var(--bg) !important; color: var(--text) !important; }
+section[data-testid="stSidebar"] { background: #07101D !important; border-right: 1px solid var(--border) !important; }
+div[data-testid="stToolbar"] { display:none; }
+.block-container { padding-top: 1.2rem; padding-bottom: 2.5rem; max-width: 1400px; }
+h1,h2,h3 { letter-spacing: -0.02em; }
+.small { color: var(--muted); font-size: 0.92rem; }
+.hr { height:1px; background:var(--border); margin:14px 0 18px 0; }
+.card{
+  background: linear-gradient(180deg, rgba(255,255,255,.03), rgba(255,255,255,.015));
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  padding: 16px 16px;
+  box-shadow: 0 12px 30px rgba(0,0,0,.25);
+}
+.card2{
+  background: rgba(255,255,255,.02);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  padding: 14px 14px;
+}
+.badge{
+  display:inline-flex; align-items:center; gap:10px;
+  background: rgba(255,255,255,.03);
+  border:1px solid var(--border);
+  border-radius: 999px;
+  padding: 8px 12px;
+  font-weight: 700;
+}
+.dot{ width:10px; height:10px; border-radius:99px; display:inline-block; }
+.dot.good{ background: var(--good); box-shadow: 0 0 16px rgba(34,197,94,.55); }
+.dot.bad{ background: var(--bad); box-shadow: 0 0 16px rgba(239,68,68,.55); }
+.dot.neu{ background: #94A3B8; box-shadow: 0 0 16px rgba(148,163,184,.35); }
+.kpiGrid{
+  display:grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap:10px;
+}
+.kpi{
+  background: rgba(255,255,255,.02);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  padding: 10px 12px;
+}
+.kpi .label{ color: var(--muted); font-size: .82rem; }
+.kpi .value{ font-size: 1.15rem; font-weight: 800; margin-top: 4px; }
+.pill{
+  display:inline-block;
+  background: var(--chip);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: .82rem;
+  color: var(--muted);
+}
+.bigTitle{
+  font-size: 2.6rem;
+  font-weight: 900;
+  margin-bottom: 0.2rem;
+}
+.subTitle{
+  color: var(--muted);
+  margin-top: 0;
+}
+.marketRow{
+  display:grid;
+  grid-template-columns: 1.6fr 1fr;
+  gap: 14px;
+  align-items: start;
+}
+@media (max-width: 1100px){
+  .marketRow{ grid-template-columns: 1fr; }
+}
+</style>
+"""
+st.markdown(PRO_CSS, unsafe_allow_html=True)
 
-# =========================================================
-# MARKET MAP (Capital.com TradingView symbols)
-# =========================================================
-@dataclass(frozen=True)
-class Market:
-    key: str
-    title: str
-    tv_symbol: str     # TradingView embed symbol
-    calc_source: str   # server-side calc source (stable, no key)
-    desc: str
+
+# =========================
+# Client-side auto refresh
+# (no extra dependency)
+# =========================
+def auto_refresh_every(ms: int):
+    components.html(
+        f"""
+        <script>
+          const ms = {ms};
+          setTimeout(() => {{
+            window.parent.location.reload();
+          }}, ms);
+        </script>
+        """,
+        height=0,
+    )
 
 
-# NOTE: calc_source uses proxies where needed; chart is always Capital.com TradingView.
-MARKETS = [
-    Market("US100", "US100 (Nasdaq CFD)", "CAPITALCOM:US100", "stooq:qqq", "Calc proxy: QQQ"),
-    Market("US500", "US500 (S&P 500 CFD)", "CAPITALCOM:US500", "stooq:spy", "Calc proxy: SPY"),
-    Market("XAUUSD", "GOLD (XAUUSD Spot)", "CAPITALCOM:GOLD", "stooq:gld", "Calc proxy: GLD"),
-    Market("EURUSD", "EURUSD", "CAPITALCOM:EURUSD", "fx:EURUSD", "Calc feed: exchangerate.host"),
-    Market("DXY", "DXY (Dollar Index)", "CAPITALCOM:DXY", "stooq:uup", "Calc proxy: UUP"),
-]
+# =========================
+# TradingView embed (big)
+# =========================
+def tradingview_widget(symbol: str, interval: str = "15", height: int = 520):
+    # interval: "1","5","15","60","240","D"
+    html = f"""
+    <div class="tradingview-widget-container" style="height:{height}px;">
+      <div id="tv_{symbol.replace(':','_')}" style="height:{height}px;"></div>
+      <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+      <script type="text/javascript">
+        new TradingView.widget({{
+          "autosize": true,
+          "symbol": "{symbol}",
+          "interval": "{interval}",
+          "timezone": "Etc/UTC",
+          "theme": "dark",
+          "style": "1",
+          "locale": "en",
+          "toolbar_bg": "#0B1220",
+          "enable_publishing": false,
+          "hide_side_toolbar": false,
+          "allow_symbol_change": false,
+          "container_id": "tv_{symbol.replace(':','_')}"
+        }});
+      </script>
+    </div>
+    """
+    components.html(html, height=height + 12)
 
 
-# =========================================================
-# INDICATORS
-# =========================================================
-def ema(s: pd.Series, span: int) -> pd.Series:
-    return s.ewm(span=span, adjust=False).mean()
+# =========================
+# Capital.com API (IG-style)
+# =========================
+@dataclass
+class CapitalSession:
+    cst: str
+    xst: str
+    created_at: float
 
+
+class CapitalClient:
+    def __init__(self, base_url: str, api_key: str, identifier: str, password: str):
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.identifier = identifier
+        self.password = password
+
+    def _headers(self, session: Optional[CapitalSession] = None) -> Dict[str, str]:
+        h = {
+            "X-IG-API-KEY": self.api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json; charset=UTF-8",
+        }
+        if session:
+            h["CST"] = session.cst
+            h["X-SECURITY-TOKEN"] = session.xst
+        return h
+
+    def login(self) -> CapitalSession:
+        # Cache in session_state (valid long enough for our use)
+        ss_key = "_capital_session"
+        if ss_key in st.session_state:
+            s: CapitalSession = st.session_state[ss_key]
+            # refresh token every ~30min
+            if time.time() - s.created_at < 30 * 60:
+                return s
+
+        url = f"{self.base_url}/session"
+        payload = {"identifier": self.identifier, "password": self.password}
+        r = requests.post(url, json=payload, headers=self._headers(), timeout=25)
+
+        if r.status_code >= 400:
+            raise RuntimeError(f"Capital login failed ({r.status_code}): {r.text[:250]}")
+
+        cst = r.headers.get("CST")
+        xst = r.headers.get("X-SECURITY-TOKEN")
+        if not cst or not xst:
+            raise RuntimeError("Capital login succeeded but CST/X-SECURITY-TOKEN missing in headers.")
+
+        sess = CapitalSession(cst=cst, xst=xst, created_at=time.time())
+        st.session_state[ss_key] = sess
+        return sess
+
+    def get(self, path: str, params: Optional[dict] = None) -> dict:
+        sess = self.login()
+        url = f"{self.base_url}{path}"
+        r = requests.get(url, headers=self._headers(sess), params=params, timeout=25)
+        if r.status_code >= 400:
+            raise RuntimeError(f"Capital GET {path} failed ({r.status_code}): {r.text[:250]}")
+        return r.json()
+
+    def search_markets(self, term: str) -> List[dict]:
+        # IG-style search endpoint
+        data = self.get("/markets", params={"searchTerm": term})
+        # Expected: {"markets":[...]}
+        return data.get("markets", []) if isinstance(data, dict) else []
+
+    def get_prices(self, epic: str, resolution: str, max_points: int = 250) -> pd.DataFrame:
+        data = self.get(f"/prices/{epic}", params={"resolution": resolution, "max": max_points})
+        prices = data.get("prices", [])
+        if not prices:
+            return pd.DataFrame()
+
+        rows = []
+        for p in prices:
+            # time in UTC like "2026-02-15T12:30:00"
+            t = p.get("snapshotTimeUTC") or p.get("snapshotTime")
+            close = (p.get("closePrice") or {}).get("bid")
+            high = (p.get("highPrice") or {}).get("bid")
+            low = (p.get("lowPrice") or {}).get("bid")
+            open_ = (p.get("openPrice") or {}).get("bid")
+            if t and close is not None:
+                rows.append((t, float(open_ or close), float(high or close), float(low or close), float(close)))
+
+        df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close"])
+        df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
+        df = df.dropna(subset=["time"]).sort_values("time").reset_index(drop=True)
+        return df
+
+
+# =========================
+# Indicators (pure pandas)
+# =========================
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
 
 def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     delta = close.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
-    avg_gain = gain.rolling(period).mean()
-    avg_loss = loss.rolling(period).mean().replace(0, np.nan)
-    rs = avg_gain / avg_loss
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / (loss.replace(0, np.nan))
     return 100 - (100 / (1 + rs))
-
-
-def macd_hist(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.Series:
-    macd_line = ema(close, fast) - ema(close, slow)
-    signal_line = ema(macd_line, signal)
-    return macd_line - signal_line
-
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high = df["high"]
@@ -104,545 +273,439 @@ def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
+def pct_change_last(close: pd.Series) -> float:
+    if len(close) < 2:
+        return 0.0
+    return float((close.iloc[-1] / close.iloc[-2] - 1) * 100)
 
-def pct_change(last: float, prev: float) -> Optional[float]:
-    if prev == 0 or prev is None or last is None:
-        return None
-    return (last - prev) / prev * 100.0
-
-
-# =========================================================
-# DATA FETCH (NO KEYS)
-# =========================================================
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_stooq_daily(symbol_lower: str, limit: int = 260) -> pd.DataFrame:
-    url = f"https://stooq.com/q/d/l/?s={symbol_lower}.us&i=d"
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-
-    df = pd.read_csv(io.StringIO(r.text))
-    df.columns = [c.lower() for c in df.columns]
-
-    # Normalize columns
-    if "date" not in df.columns:
-        raise ValueError("Stooq response missing date column")
-
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.sort_values("date").tail(limit).reset_index(drop=True)
-
-    # Ensure OHLC exists
-    needed = {"open", "high", "low", "close"}
-    if not needed.issubset(set(df.columns)):
-        raise ValueError("Stooq response missing OHLC columns")
-
-    return df
+def format_price(x: float) -> str:
+    if x >= 1000:
+        return f"{x:,.2f}"
+    if x >= 10:
+        return f"{x:.2f}"
+    return f"{x:.5f}"
 
 
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_eurusd_series(limit: int = 260) -> pd.DataFrame:
-    url = "https://api.exchangerate.host/timeseries"
-    params = {
-        "base": "EUR",
-        "symbols": "USD",
-        "start_date": (pd.Timestamp.utcnow().date() - pd.Timedelta(days=400)).isoformat(),
-        "end_date": pd.Timestamp.utcnow().date().isoformat(),
-    }
-    r = requests.get(url, params=params, timeout=25)
-    r.raise_for_status()
-    data = r.json()
+# =========================
+# Outlook / Score Model
+# (institutional-ish, simple)
+# =========================
+def outlook_from_df(df: pd.DataFrame) -> dict:
+    if df is None or df.empty or len(df) < 60:
+        return {
+            "label": "NEUTRAL",
+            "bias": "WAIT",
+            "score": 0.0,
+            "rsi": None,
+            "ema20": None,
+            "ema50": None,
+            "atr_pct": None,
+            "last": None,
+            "delta_pct": None,
+            "reason": "Not enough candle data.",
+        }
 
-    rates = data.get("rates", {})
-    rows = []
-    for d, v in rates.items():
-        usd = v.get("USD")
-        if usd is not None:
-            rows.append((pd.to_datetime(d), float(usd)))
-
-    df = pd.DataFrame(rows, columns=["date", "close"]).sort_values("date").tail(limit).reset_index(drop=True)
-    # Fake OHLC (ATR not meaningful here; we handle that)
-    df["open"] = df["close"]
-    df["high"] = df["close"]
-    df["low"] = df["close"]
-    df["volume"] = np.nan
-    return df
-
-
-def fetch_market_df(m: Market) -> Tuple[Optional[pd.DataFrame], Optional[str]]:
-    try:
-        if m.calc_source.startswith("stooq:"):
-            sym = m.calc_source.split(":", 1)[1].strip().lower()
-            return fetch_stooq_daily(sym), None
-        if m.calc_source.startswith("fx:"):
-            return fetch_eurusd_series(), None
-        return None, "Unknown calc source"
-    except Exception as e:
-        return None, str(e)
-
-
-# =========================================================
-# PRO++ FEATURES
-# =========================================================
-def current_session_bias() -> Dict[str, str]:
-    # UTC-based sessions (simple & practical)
-    h = pd.Timestamp.utcnow().hour
-    if 0 <= h < 7:
-        return {"session": "ASIA", "note": "Ranges/false breaks common. Wait for London/NY confirmation."}
-    if 7 <= h < 13:
-        return {"session": "LONDON", "note": "Highest FX momentum window. Breakouts more valid."}
-    if 13 <= h < 21:
-        return {"session": "NEW YORK", "note": "Continuation/reversals. Watch US news + DXY."}
-    return {"session": "LATE / ROLL", "note": "Liquidity lower. Prefer higher timeframe levels."}
-
-
-def weekly_resample(df: pd.DataFrame) -> pd.DataFrame:
-    d = df.copy()
-    d = d.set_index("date").sort_index()
-    w = pd.DataFrame()
-    w["open"] = d["open"].resample("W-FRI").first()
-    w["high"] = d["high"].resample("W-FRI").max()
-    w["low"] = d["low"].resample("W-FRI").min()
-    w["close"] = d["close"].resample("W-FRI").last()
-    w = w.dropna().reset_index()
-    return w
-
-
-def key_levels(df: pd.DataFrame, lookback: int = 60) -> Dict[str, float]:
-    # Swing high/low + classic pivot + fib zone from recent swing
-    d = df.tail(lookback).copy()
-    high = float(d["high"].max())
-    low = float(d["low"].min())
-    last_close = float(d["close"].iloc[-1])
-
-    # Pivot points (classic) using last candle
-    ph = float(d["high"].iloc[-1])
-    pl = float(d["low"].iloc[-1])
-    pc = float(d["close"].iloc[-1])
-    pivot = (ph + pl + pc) / 3.0
-    r1 = (2 * pivot) - pl
-    s1 = (2 * pivot) - ph
-    r2 = pivot + (ph - pl)
-    s2 = pivot - (ph - pl)
-
-    # Fib (from low -> high)
-    fib_382 = low + (high - low) * 0.382
-    fib_618 = low + (high - low) * 0.618
-
-    return {
-        "swing_high": high,
-        "swing_low": low,
-        "pivot": pivot,
-        "r1": r1,
-        "s1": s1,
-        "r2": r2,
-        "s2": s2,
-        "fib_382": fib_382,
-        "fib_618": fib_618,
-        "last_close": last_close,
-    }
-
-
-def compute_outlook(df: pd.DataFrame) -> Dict[str, Optional[float]]:
-    close = df["close"].astype(float)
+    close = df["close"]
     last = float(close.iloc[-1])
-    prev = float(close.iloc[-2]) if len(close) >= 2 else last
-    chg = pct_change(last, prev)
+    delta_pct = pct_change_last(close)
 
-    sma20 = close.rolling(20).mean()
-    sma50 = close.rolling(50).mean()
-    sma200 = close.rolling(200).mean()
+    e20 = ema(close, 20)
+    e50 = ema(close, 50)
+    r = rsi(close, 14)
+    a = atr(df, 14)
+    atr_pct = float((a.iloc[-1] / last) * 100) if not np.isnan(a.iloc[-1]) else None
 
-    rsi14 = rsi(close, 14)
-    hist = macd_hist(close)
-
-    # ATR% (only if OHLC real; for EURUSD via exchangerate host -> ATR ~ 0)
-    atrp = None
-    try:
-        a = atr(df, 14)
-        a_last = float(a.iloc[-1])
-        if not math.isnan(a_last) and last != 0:
-            atrp = (a_last / last) * 100.0
-            # EURUSD fake OHLC => atrp will be 0; treat as None
-            if atrp < 0.0001:
-                atrp = None
-    except Exception:
-        atrp = None
-
-    # Trend & momentum signals
-    trend = 0.0
-    if not math.isnan(float(sma50.iloc[-1])):
-        trend = 1.0 if last > float(sma50.iloc[-1]) else -1.0
-
-    momentum = 0.0
-    r = float(rsi14.iloc[-1]) if not math.isnan(float(rsi14.iloc[-1])) else None
-    if r is not None:
-        if r >= 60:
-            momentum = 0.8
-        elif r <= 40:
-            momentum = -0.8
-        else:
-            momentum = 0.0
-
-    macd_sig = 0.0
-    h = float(hist.iloc[-1]) if not math.isnan(float(hist.iloc[-1])) else None
-    if h is not None:
-        macd_sig = 0.6 if h > 0 else (-0.6 if h < 0 else 0.0)
-
-    # Higher timeframe filter proxy: SMA200
-    ht = 0.0
-    if len(close) >= 200 and not math.isnan(float(sma200.iloc[-1])):
-        ht = 0.4 if last > float(sma200.iloc[-1]) else -0.4
-
-    # Volatility penalty
-    vol_adj = 0.0
-    if atrp is not None:
-        if atrp > 1.3:
-            vol_adj = -0.35
-        elif atrp < 0.7:
-            vol_adj = +0.10
-
-    score = trend + momentum + macd_sig + ht + vol_adj
-    score = max(-2.2, min(2.2, score))
-
-    if score >= 0.8:
-        state, bias = "BULLISH", "BUY BIAS"
-    elif score <= -0.8:
-        state, bias = "BEARISH", "SELL BIAS"
+    # scoring
+    score = 0.0
+    # trend
+    if e20.iloc[-1] > e50.iloc[-1]:
+        score += 1.0
     else:
-        state, bias = "NEUTRAL", "WAIT / NEUTRAL"
+        score -= 1.0
+    # momentum (price vs EMA20)
+    if last > e20.iloc[-1]:
+        score += 0.6
+    else:
+        score -= 0.6
+    # RSI regime
+    if r.iloc[-1] >= 55:
+        score += 0.6
+    elif r.iloc[-1] <= 45:
+        score -= 0.6
 
-    # Confidence
-    base_conf = min(100.0, abs(score) / 2.2 * 100.0)  # 0..100
-    # Penalize if volatility very high (when available)
-    if atrp is not None and atrp > 1.3:
-        base_conf = max(0.0, base_conf - 15.0)
-    # Boost slightly if RSI agrees with trend
-    if r is not None:
-        if (trend > 0 and r > 55) or (trend < 0 and r < 45):
-            base_conf = min(100.0, base_conf + 7.0)
+    # volatility penalty (too wild = less confidence)
+    if atr_pct is not None:
+        if atr_pct > 2.0:
+            score *= 0.85
+        if atr_pct > 4.0:
+            score *= 0.75
 
+    # label
+    if score >= 0.8:
+        label = "BULLISH"
+        bias = "BUY BIAS"
+    elif score <= -0.8:
+        label = "BEARISH"
+        bias = "SELL BIAS"
+    else:
+        label = "NEUTRAL"
+        bias = "WAIT"
+
+    reason = f"EMA20/EMA50={'UP' if e20.iloc[-1] > e50.iloc[-1] else 'DOWN'}, RSI={r.iloc[-1]:.1f}, Δ={delta_pct:+.2f}%"
     return {
-        "last": last,
-        "chg": chg,
-        "sma20": float(sma20.iloc[-1]) if not math.isnan(float(sma20.iloc[-1])) else None,
-        "sma50": float(sma50.iloc[-1]) if not math.isnan(float(sma50.iloc[-1])) else None,
-        "sma200": float(sma200.iloc[-1]) if len(close) >= 200 and not math.isnan(float(sma200.iloc[-1])) else None,
-        "rsi14": r,
-        "macd_hist": h,
-        "atrp": atrp,
-        "score": score,
-        "state": state,
+        "label": label,
         "bias": bias,
-        "confidence": float(base_conf),
+        "score": float(score),
+        "rsi": float(r.iloc[-1]),
+        "ema20": float(e20.iloc[-1]),
+        "ema50": float(e50.iloc[-1]),
+        "atr_pct": atr_pct,
+        "last": last,
+        "delta_pct": delta_pct,
+        "reason": reason,
     }
 
+def mtf_votes(client: CapitalClient, epic: str) -> dict:
+    # Resolution mapping: MINUTE_15, HOUR, HOUR_4, DAY
+    frames = [
+        ("15m", "MINUTE_15"),
+        ("1h", "HOUR"),
+        ("4h", "HOUR_4"),
+        ("1D", "DAY"),
+    ]
+    votes = []
+    details = []
+    for name, res in frames:
+        df = client.get_prices(epic, res, max_points=200)
+        o = outlook_from_df(df)
+        v = 0
+        if o["label"] == "BULLISH":
+            v = 1
+        elif o["label"] == "BEARISH":
+            v = -1
+        votes.append(v)
+        details.append((name, o["label"], o["score"]))
 
-def mtf_confluence(df_daily: pd.DataFrame) -> Dict[str, str]:
-    # Daily + Weekly trend agreement
-    d_close = df_daily["close"].astype(float)
-    d_sma50 = d_close.rolling(50).mean()
-    d_last = float(d_close.iloc[-1])
-    d_trend = "UP" if not math.isnan(float(d_sma50.iloc[-1])) and d_last > float(d_sma50.iloc[-1]) else "DOWN"
-
-    w = weekly_resample(df_daily)
-    w_close = w["close"].astype(float)
-    w_sma20 = w_close.rolling(20).mean()  # weekly SMA20
-    if len(w_close) < 25 or math.isnan(float(w_sma20.iloc[-1])):
-        w_trend = "—"
+    total = sum(votes)
+    if total >= 2:
+        verdict = "BULLISH BIAS"
+    elif total <= -2:
+        verdict = "BEARISH BIAS"
     else:
-        w_trend = "UP" if float(w_close.iloc[-1]) > float(w_sma20.iloc[-1]) else "DOWN"
+        verdict = "MIXED / WAIT"
 
-    if w_trend == "—":
-        verdict = "MTF: Daily only"
-    elif d_trend == w_trend:
-        verdict = f"MTF: STRONG ({d_trend} on Daily & Weekly)"
-    else:
-        verdict = f"MTF: MIXED (Daily {d_trend} vs Weekly {w_trend})"
-
-    return {"daily": d_trend, "weekly": w_trend, "verdict": verdict}
+    return {"verdict": verdict, "details": details, "total": total}
 
 
-@st.cache_data(ttl=120, show_spinner=False)
-def eurusd_dxy_correlation() -> Tuple[Optional[float], Optional[str]]:
-    # EURUSD returns vs DXY proxy (UUP) returns - rolling corr 30D
-    try:
-        eur = fetch_eurusd_series(limit=260)[["date", "close"]].rename(columns={"close": "eurusd"})
-        dxy = fetch_stooq_daily("uup", limit=260)[["date", "close"]].rename(columns={"close": "dxy"})
-        merged = pd.merge(eur, dxy, on="date", how="inner").sort_values("date")
-        if len(merged) < 60:
-            return None, "Not enough overlap data"
-
-        re = merged["eurusd"].pct_change()
-        rd = merged["dxy"].pct_change()
-        corr = re.rolling(30).corr(rd).iloc[-1]
-        if corr is None or (isinstance(corr, float) and math.isnan(corr)):
-            return None, "Correlation unavailable"
-        return float(corr), None
-    except Exception as e:
-        return None, str(e)
-
-
-# =========================================================
-# TRADINGVIEW EMBEDS (CLIENT-SIDE)
-# =========================================================
-def tv_chart(symbol: str, height: int = 760) -> str:
-    sid = symbol.replace(":", "_").replace("/", "_")
-    return f"""
-<div class="tvwrap" style="height:{height}px;">
-  <div id="tv_{sid}" style="height:{height}px; width:100%;"></div>
-</div>
-
-<script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
-<script type="text/javascript">
-  new TradingView.widget({{
-    "autosize": true,
-    "symbol": "{symbol}",
-    "interval": "15",
-    "timezone": "Etc/UTC",
-    "theme": "light",
-    "style": "1",
-    "locale": "en",
-    "toolbar_bg": "#f5f6f8",
-    "enable_publishing": false,
-    "withdateranges": true,
-    "allow_symbol_change": false,
-    "container_id": "tv_{sid}"
-  }});
-</script>
-"""
+# =========================
+# Plotly sparkline (dark)
+# =========================
+def sparkline(df: pd.DataFrame, title: str = ""):
+    if df is None or df.empty:
+        st.caption("No data for sparkline.")
+        return
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df["time"], y=df["close"], mode="lines", name=title))
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=18, b=0),
+        height=120,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 
-def tv_ta_widget(symbol: str, height: int = 460) -> str:
-    return f"""
-<div class="tradingview-widget-container">
-  <div class="tradingview-widget-container__widget"></div>
-  <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-technical-analysis.js" async>
-  {{
-    "interval": "15m",
-    "width": "100%",
-    "isTransparent": false,
-    "height": "{height}",
-    "symbol": "{symbol}",
-    "showIntervalTabs": true,
-    "locale": "en",
-    "colorTheme": "light"
-  }}
-  </script>
-</div>
-"""
+# =========================
+# Markets config (TradingView symbols)
+# NOTE: EPIC must be set via sidebar finder.
+# =========================
+DEFAULT_MARKETS = [
+    {"key": "US100", "name": "US100 (Nasdaq)", "tv": "CAPITALCOM:US100", "search": "US 100"},
+    {"key": "US500", "name": "US500 (S&P 500)", "tv": "CAPITALCOM:US500", "search": "US 500"},
+    {"key": "XAUUSD", "name": "Gold (XAUUSD)", "tv": "CAPITALCOM:GOLD", "search": "Gold"},
+    {"key": "EURUSD", "name": "EURUSD", "tv": "CAPITALCOM:EURUSD", "search": "EUR/USD"},
+    {"key": "DXY", "name": "US Dollar Index (DXY)", "tv": "CAPITALCOM:DXY", "search": "Dollar Index"},
+]
 
 
-# =========================================================
-# SIDEBAR + AUTO REFRESH
-# =========================================================
-with st.sidebar:
-    st.header("Settings")
-    refresh = st.number_input("Auto refresh (seconds)", min_value=30, max_value=600, value=DEFAULT_REFRESH_SEC, step=30)
-    st.caption("Tip: 120s is stable. Too low can cause rate limits on free feeds.")
-    st.divider()
-    s = current_session_bias()
-    st.subheader("Session (UTC)")
-    st.write(f"**{s['session']}**")
-    st.caption(s["note"])
-    st.divider()
-    st.subheader("Markets")
-    st.write("US100 • US500 • GOLD(XAUUSD) • EURUSD • DXY")
-    st.caption("Charts = Capital.com TradingView\n\nOutlook = server-side indicators (stable feeds)")
-
-
-# Auto refresh (client-side)
+# =========================
+# Sidebar: settings + EPIC finder
+# =========================
+st.markdown('<div class="bigTitle">🚀 UnknownFX Dashboard</div>', unsafe_allow_html=True)
 st.markdown(
-    f"""
-<script>
-  setTimeout(function(){{ window.location.reload(); }}, {int(refresh)*1000});
-</script>
-""",
+    '<p class="subTitle">Institutional view • Capital.com data (candles) • TradingView charts • MTF confluence • Auto refresh</p>',
     unsafe_allow_html=True,
 )
+st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
 
+with st.sidebar:
+    st.markdown("### ⚙️ Settings")
+    refresh_minutes = st.slider("Auto refresh (minutes)", 1, 10, 2)
+    tv_interval = st.selectbox("TradingView interval", ["1", "5", "15", "60", "240", "D"], index=2)
+    st.caption("Tip: 15m is nice for intraday bias. 60m/240m for cleaner trend.")
 
-# =========================================================
-# HEADER
-# =========================================================
-st.title(APP_TITLE)
-st.caption("MTF confluence • Key levels • Confidence % • Session bias • DXY correlation • Professional clean layout")
+    st.markdown("---")
+    st.markdown("### 🔑 Capital.com (required)")
+    missing = []
+    for k in ["CAPITAL_API_KEY", "CAPITAL_IDENTIFIER", "CAPITAL_PASSWORD", "CAPITAL_API_BASE"]:
+        if k not in st.secrets:
+            missing.append(k)
+    if missing:
+        st.error("Missing secrets: " + ", ".join(missing))
+        st.stop()
 
-corr, corr_err = eurusd_dxy_correlation()
-cA, cB, cC = st.columns([1.2, 1, 1])
+    client = CapitalClient(
+        base_url=st.secrets["CAPITAL_API_BASE"],
+        api_key=st.secrets["CAPITAL_API_KEY"],
+        identifier=st.secrets["CAPITAL_IDENTIFIER"],
+        password=st.secrets["CAPITAL_PASSWORD"],
+    )
 
-with cA:
-    s = current_session_bias()
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown(f'<div class="mid">Session (UTC): <b>{s["session"]}</b></div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="meta">{s["note"]}</div>', unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown("---")
+    st.markdown("### 🧭 EPIC finder (1x instellen)")
+    st.caption("Capital gebruikt EPICs. Zoek je market → kies → klik **Use this EPIC**.")
 
-with cB:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="mid">EURUSD ↔ DXY Correlation (30D)</div>', unsafe_allow_html=True)
-    if corr_err or corr is None:
-        st.markdown(f'<div class="meta">— ({corr_err or "unavailable"})</div>', unsafe_allow_html=True)
+    if "epic_map" not in st.session_state:
+        st.session_state["epic_map"] = {}  # key -> epic
+
+    chosen_market_key = st.selectbox("Market to set EPIC for", [m["key"] for m in DEFAULT_MARKETS], index=0)
+    search_term_default = next(m["search"] for m in DEFAULT_MARKETS if m["key"] == chosen_market_key)
+    search_term = st.text_input("Search term", value=search_term_default)
+
+    colA, colB = st.columns([1, 1])
+    with colA:
+        do_search = st.button("Search EPICs", use_container_width=True)
+    with colB:
+        st.button("Clear EPICs", use_container_width=True, on_click=lambda: st.session_state["epic_map"].clear())
+
+    if do_search:
+        try:
+            results = client.search_markets(search_term)
+            st.session_state["_last_search_results"] = results
+        except Exception as e:
+            st.error(str(e))
+
+    results = st.session_state.get("_last_search_results", [])
+    if results:
+        options = []
+        for r in results[:30]:
+            # r fields: epic, instrumentName, instrumentType, marketStatus, ...
+            epic = r.get("epic", "")
+            name = r.get("instrumentName", "")
+            typ = r.get("instrumentType", "")
+            options.append((f"{name} • {typ} • {epic}", epic))
+
+        label = st.selectbox("Pick result", [o[0] for o in options])
+        epic = dict(options)[label]
+        st.code(epic, language="text")
+        if st.button("Use this EPIC", use_container_width=True):
+            st.session_state["epic_map"][chosen_market_key] = epic
+            st.success(f"Saved EPIC for {chosen_market_key}")
+
+    st.markdown("---")
+    st.markdown("### ✅ Current EPIC map")
+    if st.session_state["epic_map"]:
+        st.json(st.session_state["epic_map"])
     else:
-        tag = "warn" if corr > -0.20 else "neut"
-        st.markdown(f'<span class="pill {tag}">{corr:+.2f}</span>', unsafe_allow_html=True)
-        st.markdown(
-            '<div class="meta">Normally negative. If it becomes less negative/positive, be careful with EURUSD signals.</div>',
-            unsafe_allow_html=True,
-        )
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with cC:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="mid">Refresh</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="big">{int(refresh)}s</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="meta">Last refresh: {time.strftime("%Y-%m-%d %H:%M:%S")} UTC</div>', unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+        st.info("Nog leeg. Stel EPICs in met de finder hierboven.")
 
 
-# =========================================================
-# OVERVIEW ROW
-# =========================================================
-st.subheader("Market Outlook — Overview")
-overview_cols = st.columns(len(MARKETS))
+# Auto refresh
+auto_refresh_every(refresh_minutes * 60 * 1000)
 
-market_cache: Dict[str, Dict] = {}
 
-for i, m in enumerate(MARKETS):
-    df, err = fetch_market_df(m)
-    with overview_cols[i]:
-        st.markdown(f"### {m.key}")
-        st.caption(m.title)
+# =========================
+# Top: Global Risk Meter
+# =========================
+def risk_meter(scores: List[float]) -> Tuple[str, float]:
+    if not scores:
+        return "NEUTRAL", 0.0
+    s = float(np.mean(scores))
+    if s >= 0.6:
+        return "RISK-ON", s
+    if s <= -0.6:
+        return "RISK-OFF", s
+    return "NEUTRAL", s
 
-        if err or df is None or len(df) < 80:
-            st.markdown('<div class="card">', unsafe_allow_html=True)
-            st.markdown('<span class="pill bear">DATA ERROR</span>', unsafe_allow_html=True)
-            st.write(err or "Not enough data")
-            st.markdown("</div>", unsafe_allow_html=True)
+
+# =========================
+# Main render: 1 per row
+# =========================
+scores_for_global = []
+
+for m in DEFAULT_MARKETS:
+    key = m["key"]
+    name = m["name"]
+    tv_symbol = m["tv"]
+    epic = st.session_state["epic_map"].get(key)
+
+    st.markdown(f"## {name}")
+    st.markdown('<div class="marketRow">', unsafe_allow_html=True)
+
+    # LEFT: big chart
+    left = st.container()
+    with left:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+        tradingview_widget(tv_symbol, interval=tv_interval, height=560)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # RIGHT: stats + outlook
+    right = st.container()
+    with right:
+        st.markdown('<div class="card">', unsafe_allow_html=True)
+
+        if not epic:
+            st.warning(f"EPIC ontbreekt voor {key}. Ga naar sidebar → EPIC finder → stel hem 1x in.")
+            st.markdown(f"<span class='pill'>TradingView: {tv_symbol}</span>", unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
             continue
 
-        o = compute_outlook(df)
-        mtf = mtf_confluence(df)
-        lv = key_levels(df, lookback=60)
+        try:
+            df_15m = client.get_prices(epic, "MINUTE_15", max_points=260)
+            out = outlook_from_df(df_15m)
+            mtf = mtf_votes(client, epic)
+        except Exception as e:
+            st.error(f"Capital data error for {key}: {e}")
+            st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown('</div>', unsafe_allow_html=True)
+            st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+            continue
 
-        market_cache[m.key] = {"df": df, "outlook": o, "mtf": mtf, "levels": lv}
+        label = out["label"]
+        dot_class = "neu"
+        if label == "BULLISH":
+            dot_class = "good"
+        elif label == "BEARISH":
+            dot_class = "bad"
 
-        state = o["state"]
-        cls = "neut"
-        if state == "BULLISH":
-            cls = "bull"
-        elif state == "BEARISH":
-            cls = "bear"
+        scores_for_global.append(out["score"])
 
-        chg = o.get("chg")
-        chg_txt = "—" if chg is None else f"{chg:+.2f}%"
-
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown(f'<span class="pill {cls}">{state}</span>', unsafe_allow_html=True)
-        st.markdown(f'<div class="big">{o["bias"]}</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="meta">Confidence: <b>{o["confidence"]:.0f}%</b> • Score: {o["score"]:+.2f}</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="meta">Last (calc): {o["last"]:.4f} • Δ {chg_txt}</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="meta">{mtf["verdict"]}</div>', unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
-
-
-# =========================================================
-# DETAILS: 1 MARKET PER ROW
-# =========================================================
-st.subheader("Pro++ Detail View (1 per row)")
-
-for m in MARKETS:
-    st.markdown(f"## {m.title}")
-
-    df, err = fetch_market_df(m)
-    if err or df is None or len(df) < 80:
-        st.error(f"Feed error for {m.key}: {err or 'unknown'}")
-        st.markdown(tv_chart(m.tv_symbol, height=780), unsafe_allow_html=True)
-        st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
-        continue
-
-    o = compute_outlook(df)
-    mtf = mtf_confluence(df)
-    lv = key_levels(df, lookback=60)
-
-    # TOP METRICS
-    a, b, c, d, e = st.columns([1.1, 1, 1, 1, 1])
-    with a:
-        st.metric("Outlook", o["state"])
-        st.write(f"**Bias:** {o['bias']}")
-        st.caption(f"Chart: {m.tv_symbol} • {m.desc}")
-    with b:
-        st.metric("Confidence", f"{o['confidence']:.0f}%")
-    with c:
-        st.metric("RSI(14)", "—" if o["rsi14"] is None else f"{o['rsi14']:.1f}")
-    with d:
-        st.metric("SMA20/SMA50", "—" if (o["sma20"] is None or o["sma50"] is None) else f"{o['sma20']:.2f} / {o['sma50']:.2f}")
-    with e:
-        st.metric("Volatility (ATR%)", "—" if o["atrp"] is None else f"{o['atrp']:.2f}%")
-
-    # KEY LEVELS + MTF BOX
-    k1, k2 = st.columns([1.15, 1.85])
-    with k1:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("<div class='mid'>Key Levels (last ~60D)</div>", unsafe_allow_html=True)
         st.markdown(
             f"""
-<div class="meta">
-<b>Pivot:</b> {lv["pivot"]:.2f}<br/>
-<b>R1/R2:</b> {lv["r1"]:.2f} / {lv["r2"]:.2f}<br/>
-<b>S1/S2:</b> {lv["s1"]:.2f} / {lv["s2"]:.2f}<br/>
-<b>Swing High/Low:</b> {lv["swing_high"]:.2f} / {lv["swing_low"]:.2f}<br/>
-<b>Fib Zone:</b> {lv["fib_382"]:.2f} – {lv["fib_618"]:.2f}
-</div>
-""",
+            <div class="badge">
+              <span class="dot {dot_class}"></span>
+              <span>{label}</span>
+              <span class="pill">{out["bias"]}</span>
+              <span class="pill">score {out["score"]:+.2f}</span>
+            </div>
+            <div class="small" style="margin-top:10px;">{out["reason"]}</div>
+            """,
             unsafe_allow_html=True,
         )
-        st.markdown("</div>", unsafe_allow_html=True)
 
-    with k2:
-        st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown("<div class='mid'>MTF Confluence</div>", unsafe_allow_html=True)
+        # KPIs
+        last = out["last"]
+        delta_pct = out["delta_pct"]
+        rsi_v = out["rsi"]
+        atr_pct_v = out["atr_pct"]
+
+        st.markdown('<div style="height:10px;"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="kpiGrid">', unsafe_allow_html=True)
+
         st.markdown(
             f"""
-<div class="meta">
-<b>Daily trend:</b> {mtf["daily"]} (price vs SMA50)<br/>
-<b>Weekly trend:</b> {mtf["weekly"]} (price vs weekly SMA20)<br/>
-<b>Verdict:</b> {mtf["verdict"]}<br/><br/>
-<b>Rule of thumb:</b> Only take aggressive entries when Daily & Weekly agree.
-</div>
-""",
+            <div class="kpi">
+              <div class="label">Last (Capital)</div>
+              <div class="value">{format_price(last) if last is not None else "—"}</div>
+            </div>
+            """,
             unsafe_allow_html=True,
         )
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    # BIG CHART
-    st.markdown(tv_chart(m.tv_symbol, height=820), unsafe_allow_html=True)
-
-    # OPTIONAL: TradingView TA widget (visual multi-interval)
-    with st.expander("TradingView Technical Analysis (visual, multi-interval)"):
-        st.markdown(tv_ta_widget(m.tv_symbol, height=520), unsafe_allow_html=True)
-
-    # RULES EXPLAINER
-    with st.expander("Waarom deze outlook? (PRO++ rules)"):
-        st.write(
-            """
-**Outlook score bestaat uit:**
-- Trend: price > SMA50 → bullish, anders bearish
-- Momentum: RSI ≥ 60 bullish / RSI ≤ 40 bearish
-- MACD histogram: >0 bullish / <0 bearish
-- HT filter: price > SMA200 → extra bullish bias (anders bearish)
-- Volatility adjust: extreem hoog = lagere conviction
-
-**Confidence %**
-- gebaseerd op absolute score + volatility penalty + RSI/trend agreement
-
-**Key levels**
-- Classic pivot + swing high/low + fib zone (60D) → perfecte zones om entries te plannen.
-"""
+        st.markdown(
+            f"""
+            <div class="kpi">
+              <div class="label">Δ last candle</div>
+              <div class="value">{delta_pct:+.2f}%</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            f"""
+            <div class="kpi">
+              <div class="label">RSI(14)</div>
+              <div class="value">{rsi_v:.1f if rsi_v is not None else "—"}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
 
-    st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
 
-st.caption(f"✅ Running stable • Auto refresh: {int(refresh)}s • UTC: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        # EMA + ATR line
+        st.markdown('<div style="height:10px;"></div>', unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <div class="card2">
+              <div class="small"><b>Trend / Volatility</b></div>
+              <div class="small">EMA20: {format_price(out["ema20"]) if out["ema20"] else "—"} • EMA50: {format_price(out["ema50"]) if out["ema50"] else "—"}</div>
+              <div class="small">ATR% (proxy): {atr_pct_v:.2f}%</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # Sparkline
+        st.markdown('<div style="height:10px;"></div>', unsafe_allow_html=True)
+        st.markdown("<div class='card2'><div class='small'><b>Intraday movement (15m)</b></div>", unsafe_allow_html=True)
+        sparkline(df_15m, title=key)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        # MTF confluence
+        st.markdown('<div style="height:10px;"></div>', unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <div class="card2">
+              <div class="small"><b>MTF Confluence (15m → 1D)</b></div>
+              <div style="margin-top:6px;">
+                <span class="pill">{mtf["verdict"]}</span>
+                <span class="pill">votes {mtf["total"]:+d}</span>
+              </div>
+              <div class="small" style="margin-top:10px;">
+                {" • ".join([f"{t}:{lab}" for (t, lab, sc) in mtf["details"]])}
+              </div>
+              <div class="small" style="margin-top:8px; color: var(--muted);">
+                Rule of thumb: agressief traden alleen als 4h & 1D dezelfde kant op wijzen.
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown(f"<div class='small' style='margin-top:10px;'><span class='pill'>EPIC</span> {epic}</div>", unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)  # marketRow
+    st.markdown('<div class="hr"></div>', unsafe_allow_html=True)
+
+
+# Global banner at bottom/top feel
+risk_label, risk_score = risk_meter(scores_for_global)
+st.markdown("### 🌍 Global Risk Regime")
+dot = "neu"
+if risk_label == "RISK-ON":
+    dot = "good"
+elif risk_label == "RISK-OFF":
+    dot = "bad"
+
+st.markdown(
+    f"""
+    <div class="card">
+      <div class="badge">
+        <span class="dot {dot}"></span>
+        <span>{risk_label}</span>
+        <span class="pill">avg score {risk_score:+.2f}</span>
+        <span class="pill">refresh {int(refresh_minutes)}m</span>
+      </div>
+      <div class="small" style="margin-top:10px;">
+        Dit is de gemiddelde bias van je watchlist. Gebruik dit als “context” voor entries, niet als single signal.
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)

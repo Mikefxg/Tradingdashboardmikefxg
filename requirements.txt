@@ -1,3 +1,5 @@
 streamlit
-tradingview-ta
+yfinance
+pandas
+numpy
 streamlit-autorefresh

@@ -2,4 +2,3 @@ streamlit
 requests
 pandas
 numpy
-streamlit-autorefresh

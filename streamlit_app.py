@@ -1,342 +1,348 @@
 # streamlit_app.py
 from __future__ import annotations
 
-import time
+import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple
 
 import streamlit as st
-from tradingview_ta import TA_Handler, Interval, Exchange
+import streamlit.components.v1 as components
+from streamlit_autorefresh import st_autorefresh
 
-# =========================
-# SETTINGS (pas hier aan)
-# =========================
+from tradingview_ta import TA_Handler, Interval  # <-- GEEN TradingViewTAError import
 
-REFRESH_SECONDS = 600  # 10 minuten
-INTERVAL = Interval.INTERVAL_15_MINUTES  # 15m werkt fijn voor sentiment
 
-# 100% instelbaar: probeer eerst Capital.com-achtige symbols.
-# Vul hier EXACT in wat jij in TradingView ziet (symbool + exchange/screener context).
-# Als een symbool niet bestaat, probeert het script fallbacks.
-SYMBOLS: Dict[str, Dict[str, str]] = {
-    "US100 (Nasdaq 100)": {
-        "symbol": "US100",
-        "screener": "cfd",
-        "exchange": "CAPITALCOM",
-        "fallbacks": "NDX, NAS100, US100USD, US100IDX, QQQ",
-    },
-    "US500 (S&P 500)": {
-        "symbol": "US500",
-        "screener": "cfd",
-        "exchange": "CAPITALCOM",
-        "fallbacks": "SPX, SP500, US500USD, US500IDX, SPY",
-    },
-    "US30 (Dow Jones)": {
-        "symbol": "US30",
-        "screener": "cfd",
-        "exchange": "CAPITALCOM",
-        "fallbacks": "DJI, DJIA, US30USD, US30IDX, DIA",
-    },
-    "XAUUSD (Gold Spot)": {
-        "symbol": "XAUUSD",
-        "screener": "cfd",
-        "exchange": "CAPITALCOM",
-        "fallbacks": "XAUUSD, GOLD, XAUUSDUSD",
-    },
-    "EURUSD": {
-        "symbol": "EURUSD",
-        "screener": "forex",
-        "exchange": "OANDA",
-        "fallbacks": "EURUSD, FX:EURUSD, OANDA:EURUSD, FOREXCOM:EURUSD",
-    },
-    "DXY (Dollar Index)": {
-        "symbol": "DXY",
-        "screener": "forex",
-        "exchange": "TVC",
-        "fallbacks": "DXY, TVC:DXY, ICEUS:DXY",
-    },
+# -----------------------------
+# Config
+# -----------------------------
+st.set_page_config(page_title="Market Sentiment (TradingView x Capital.com)", layout="wide")
+
+DEFAULT_EXCHANGE = "CAPITALCOM"
+
+DEFAULT_MARKETS = {
+    "US100 (Nasdaq CFD)": {"symbol": "US100", "screener": "cfd"},
+    "US500 (S&P CFD)": {"symbol": "US500", "screener": "cfd"},
+    "US30 (Dow CFD)": {"symbol": "US30", "screener": "cfd"},
+    "GOLD (XAUUSD)": {"symbol": "GOLD", "screener": "cfd"},
+    "EURUSD": {"symbol": "EURUSD", "screener": "forex"},
+    "DXY (US Dollar Index)": {"symbol": "DXY", "screener": "cfd"},
 }
 
-# =========================
-# UI helpers
-# =========================
 
-st.set_page_config(page_title="Market Sentiment Dashboard", layout="wide")
-
-st.markdown(
-    """
-    <style>
-      .big-title { font-size: 56px; font-weight: 800; margin-bottom: 0.2rem; }
-      .subtle { color: #777; margin-top: 0; }
-      .pill { display:inline-block; padding: 6px 10px; border-radius: 999px; font-weight: 700; }
-      .bull { background: #e7f7ed; color: #177245; }
-      .bear { background: #fde8e8; color: #a61b1b; }
-      .neut { background: #f1f3f5; color: #444; }
-      .card { border: 1px solid #eee; border-radius: 16px; padding: 16px; }
-      .muted { color: #666; font-size: 14px; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
-
-# =========================
-# TA logic
-# =========================
-
+# -----------------------------
+# Helpers
+# -----------------------------
 @dataclass
 class MarketResult:
     ok: bool
-    used: str
-    sentiment: str
-    bias: str
+    reason: str
     score: float
+    bias: str
+    tv_rec: str
     last: Optional[float]
     rsi: Optional[float]
-    sma20: Optional[float]
-    sma50: Optional[float]
-    macd: Optional[float]
-    rec: Optional[str]
-    error: Optional[str]
+    adx: Optional[float]
+    vol_pct: Optional[float]
+    details: Dict[str, float]
 
 
-def safe_float(x) -> Optional[float]:
+def _safe_float(x) -> Optional[float]:
     try:
         if x is None:
             return None
-        return float(x)
+        v = float(x)
+        if math.isnan(v) or math.isinf(v):
+            return None
+        return v
     except Exception:
         return None
 
 
-def calc_score(ind: Dict) -> Tuple[float, str, str]:
+def compute_score(ind: Dict[str, float]) -> Tuple[float, Dict[str, float]]:
     """
-    Score = combinatie van:
-    - SMA20 vs SMA50 (trend)
+    Score in range ~[-3, +3]
+    Based on:
+    - Price vs SMA20/SMA50 (trend)
     - RSI (momentum)
-    - MACD.hist (momentum)
-    - TradingView recommendation (bias)
-    Output: (score -2..+2), sentiment label, buy/sell bias text
+    - MACD histogram (momentum)
+    - ADX (trend strength) boosts trend signals
+    - ATR% (volatility proxy) shown, not used heavily in bias
     """
+    d: Dict[str, float] = {}
+
+    close = _safe_float(ind.get("close"))
+    sma20 = _safe_float(ind.get("SMA20"))
+    sma50 = _safe_float(ind.get("SMA50"))
+    rsi = _safe_float(ind.get("RSI"))
+    adx = _safe_float(ind.get("ADX"))
+
+    macd = _safe_float(ind.get("MACD.macd"))
+    macd_signal = _safe_float(ind.get("MACD.signal"))
+    macd_hist = None
+    if macd is not None and macd_signal is not None:
+        macd_hist = macd - macd_signal
+
+    atr = _safe_float(ind.get("ATR"))
+    vol_pct = None
+    if atr is not None and close is not None and close != 0:
+        vol_pct = (atr / close) * 100.0
+
     score = 0.0
 
-    rsi = safe_float(ind.get("RSI"))
-    sma20 = safe_float(ind.get("SMA20"))
-    sma50 = safe_float(ind.get("SMA50"))
-    macd = safe_float(ind.get("MACD.macd"))
-    macds = safe_float(ind.get("MACD.signal"))
+    # Trend (price vs averages)
+    if close is not None and sma20 is not None:
+        s = 0.6 if close > sma20 else (-0.6 if close < sma20 else 0.0)
+        score += s
+        d["trend_vs_sma20"] = s
 
-    # Trend
-    if sma20 is not None and sma50 is not None:
-        if sma20 > sma50:
-            score += 0.6
-        elif sma20 < sma50:
-            score -= 0.6
+    if close is not None and sma50 is not None:
+        s = 0.6 if close > sma50 else (-0.6 if close < sma50 else 0.0)
+        score += s
+        d["trend_vs_sma50"] = s
 
-    # RSI
+    # Momentum (RSI)
     if rsi is not None:
-        if rsi >= 55:
-            score += 0.4
-        elif rsi <= 45:
-            score -= 0.4
-
-    # MACD approx (macd - signal)
-    if macd is not None and macds is not None:
-        hist = macd - macds
-        if hist > 0:
-            score += 0.3
-        elif hist < 0:
-            score -= 0.3
-
-    # Recommendation
-    rec = (ind.get("Recommend.All") or "").upper()
-    # tradingview-ta geeft vaak "BUY"/"SELL"/"NEUTRAL"/"STRONG_BUY"/"STRONG_SELL"
-    if "STRONG_BUY" in rec:
-        score += 0.7
-    elif rec == "BUY":
-        score += 0.4
-    elif "STRONG_SELL" in rec:
-        score -= 0.7
-    elif rec == "SELL":
-        score -= 0.4
-
-    # Label
-    if score >= 0.6:
-        sentiment = "BULLISH"
-        bias = "BUY BIAS"
-    elif score <= -0.6:
-        sentiment = "BEARISH"
-        bias = "SELL BIAS"
-    else:
-        sentiment = "NEUTRAL"
-        bias = "WAIT / NEUTRAL"
-
-    return score, sentiment, bias
-
-
-def build_handler(symbol: str, screener: str, exchange: str) -> TA_Handler:
-    h = TA_Handler(
-        symbol=symbol,
-        screener=screener,
-        exchange=exchange,
-        interval=INTERVAL,
-    )
-    return h
-
-
-def try_fetch_ta(name: str, cfg: Dict[str, str]) -> MarketResult:
-    primary = (cfg.get("symbol", ""), cfg.get("screener", ""), cfg.get("exchange", ""))
-    fallbacks = [s.strip() for s in (cfg.get("fallbacks", "") or "").split(",") if s.strip()]
-
-    candidates: List[Tuple[str, str, str]] = [primary]
-
-    # fallback logic:
-    # - Als fallback een "EXCHANGE:SYMBOL" bevat, splitsen we
-    # - Anders proberen we zelfde screener/exchange
-    for fb in fallbacks:
-        if ":" in fb:
-            ex, sym = fb.split(":", 1)
-            candidates.append((sym.strip(), cfg.get("screener", ""), ex.strip()))
+        # Map RSI: 50 is neutral, >60 bullish, <40 bearish
+        if rsi >= 60:
+            s = 0.6
+        elif rsi <= 40:
+            s = -0.6
         else:
-            candidates.append((fb, cfg.get("screener", ""), cfg.get("exchange", "")))
+            s = (rsi - 50.0) / 20.0  # [-0.5, +0.5]
+        score += s
+        d["rsi_signal"] = s
 
-    last_error = None
+    # Momentum (MACD histogram)
+    if macd_hist is not None:
+        s = 0.6 if macd_hist > 0 else (-0.6 if macd_hist < 0 else 0.0)
+        score += s
+        d["macd_hist_signal"] = s
 
-    for sym, screener, exch in candidates:
-        if not sym or not screener or not exch:
-            continue
-        try:
-            handler = build_handler(sym, screener, exch)
-            analysis = handler.get_analysis()
-            ind = analysis.indicators or {}
+    # Trend strength boost (ADX)
+    if adx is not None:
+        # ADX >= 25 means trend is stronger -> amplify trend part a bit
+        boost = 1.0
+        if adx >= 25:
+            boost = 1.15
+        elif adx <= 15:
+            boost = 0.9
+        score *= boost
+        d["adx_boost"] = boost
 
-            score, sentiment, bias = calc_score(ind)
+    # Keep within a nice band
+    score = max(-3.0, min(3.0, score))
+    if vol_pct is not None:
+        d["vol_pct"] = vol_pct
 
-            last = safe_float(ind.get("close"))
-            rsi = safe_float(ind.get("RSI"))
-            sma20 = safe_float(ind.get("SMA20"))
-            sma50 = safe_float(ind.get("SMA50"))
+    return score, d
 
-            macd = None
-            m = safe_float(ind.get("MACD.macd"))
-            s = safe_float(ind.get("MACD.signal"))
-            if m is not None and s is not None:
-                macd = m - s
 
-            rec = (analysis.summary or {}).get("RECOMMENDATION")
-            used = f"{exch}:{sym} ({screener})"
+def score_to_bias(score: float) -> str:
+    if score >= 0.7:
+        return "BULLISH"
+    if score <= -0.7:
+        return "BEARISH"
+    return "NEUTRAL"
 
-            return MarketResult(
-                ok=True,
-                used=used,
-                sentiment=sentiment,
-                bias=bias,
-                score=score,
-                last=last,
-                rsi=rsi,
-                sma20=sma20,
-                sma50=sma50,
-                macd=macd,
-                rec=rec,
-                error=None,
-            )
-        except Exception as e:
-            last_error = str(e)
 
-    return MarketResult(
-        ok=False,
-        used=f"{cfg.get('exchange')}:{cfg.get('symbol')} ({cfg.get('screener')})",
-        sentiment="NEUTRAL",
-        bias="NO DATA",
-        score=0.0,
-        last=None,
-        rsi=None,
-        sma20=None,
-        sma50=None,
-        macd=None,
-        rec=None,
-        error=last_error or "Unknown error",
+@st.cache_data(ttl=600)  # 10 min cache
+def fetch_tv_analysis(symbol: str, exchange: str, screener: str, interval: str) -> Dict:
+    handler = TA_Handler(
+        symbol=symbol,
+        exchange=exchange,
+        screener=screener,
+        interval=interval,
     )
+    analysis = handler.get_analysis()
+    return {
+        "summary": dict(analysis.summary) if analysis.summary else {},
+        "indicators": dict(analysis.indicators) if analysis.indicators else {},
+    }
 
 
-# =========================
-# Auto-refresh
-# =========================
-
-def auto_refresh(seconds: int):
-    # simpele auto-refresh zonder extra packages
-    st.markdown(
-        f"""
-        <script>
-        setTimeout(function() {{
-            window.location.reload();
-        }}, {seconds * 1000});
-        </script>
-        """,
-        unsafe_allow_html=True,
-    )
+def tv_symbol(exchange: str, symbol: str) -> str:
+    return f"{exchange}:{symbol}"
 
 
-# =========================
-# Page
-# =========================
+def tradingview_iframe(symbol_full: str, interval: str, height: int = 420) -> None:
+    # TradingView widget embed (no key needed)
+    # interval mapping to widget:
+    interval_map = {
+        Interval.INTERVAL_1_MINUTE: "1",
+        Interval.INTERVAL_5_MINUTES: "5",
+        Interval.INTERVAL_15_MINUTES: "15",
+        Interval.INTERVAL_30_MINUTES: "30",
+        Interval.INTERVAL_1_HOUR: "60",
+        Interval.INTERVAL_4_HOURS: "240",
+        Interval.INTERVAL_1_DAY: "D",
+    }
+    i = interval_map.get(interval, "15")
 
-st.markdown('<div class="big-title">📈 Market Sentiment (TradingView)</div>', unsafe_allow_html=True)
-st.markdown(
-    f'<p class="subtle">Refresh elke 10 min • Interval: 15m • Bron: TradingView Technicals via tradingview-ta</p>',
-    unsafe_allow_html=True
+    html = f"""
+    <iframe
+      src="https://s.tradingview.com/widgetembed/?symbol={symbol_full}&interval={i}&hidesidetoolbar=1&symboledit=0&saveimage=0&toolbarbg=f1f3f6&studies=[]&theme=light&style=1&timezone=Etc%2FUTC&withdateranges=1&hideideas=1"
+      style="width: 100%; height: {height}px; border: 0; border-radius: 12px;"
+      loading="lazy"
+    ></iframe>
+    """
+    components.html(html, height=height + 20)
+
+
+def badge(text: str) -> str:
+    return f"<span style='padding:6px 10px;border-radius:999px;background:#f2f2f2;font-weight:700;'>{text}</span>"
+
+
+def bias_badge(bias: str) -> str:
+    if bias == "BULLISH":
+        color = "#19a34a"
+        bg = "#e9f9ef"
+    elif bias == "BEARISH":
+        color = "#d11a2a"
+        bg = "#fdecee"
+    else:
+        color = "#444"
+        bg = "#f3f4f6"
+    return f"<span style='padding:8px 12px;border-radius:999px;background:{bg};color:{color};font-weight:900;'>{bias}</span>"
+
+
+# -----------------------------
+# Sidebar settings
+# -----------------------------
+st.sidebar.header("Settings")
+
+refresh_minutes = st.sidebar.number_input("Auto refresh (minutes)", min_value=1, max_value=60, value=10, step=1)
+st_autorefresh(interval=refresh_minutes * 60 * 1000, key="auto_refresh")
+
+exchange = st.sidebar.text_input("TradingView exchange", value=DEFAULT_EXCHANGE)
+
+interval_label = st.sidebar.selectbox(
+    "Interval",
+    options=["15m", "30m", "1h", "4h", "1D"],
+    index=0,
 )
 
-auto_refresh(REFRESH_SECONDS)
+interval_map = {
+    "15m": Interval.INTERVAL_15_MINUTES,
+    "30m": Interval.INTERVAL_30_MINUTES,
+    "1h": Interval.INTERVAL_1_HOUR,
+    "4h": Interval.INTERVAL_4_HOURS,
+    "1D": Interval.INTERVAL_1_DAY,
+}
+interval = interval_map[interval_label]
 
-cols = st.columns(len(SYMBOLS))
+st.sidebar.markdown("---")
+st.sidebar.subheader("Tickers (instelbaar)")
 
-for col, (market_name, cfg) in zip(cols, SYMBOLS.items()):
-    with col:
-        res = try_fetch_ta(market_name, cfg)
+markets_cfg = {}
+for name, cfg in DEFAULT_MARKETS.items():
+    sym = st.sidebar.text_input(f"{name} • symbol", value=cfg["symbol"])
+    scr = st.sidebar.selectbox(f"{name} • screener", options=["cfd", "forex"], index=(0 if cfg["screener"] == "cfd" else 1))
+    markets_cfg[name] = {"symbol": sym.strip().upper(), "screener": scr}
 
-        pill_class = "neut"
-        if res.sentiment == "BULLISH":
-            pill_class = "bull"
-        elif res.sentiment == "BEARISH":
-            pill_class = "bear"
+st.sidebar.markdown("---")
+show_charts = st.sidebar.checkbox("Show charts", value=True)
+st.sidebar.caption("Tip: als je ‘Feed error’ krijgt, pas exchange/screener/symbol aan totdat TradingView TA het vindt.")
 
-        st.markdown(f'<div class="card">', unsafe_allow_html=True)
-        st.markdown(f"### {market_name}")
+# -----------------------------
+# UI
+# -----------------------------
+st.title("📈 Market Sentiment (TradingView × Capital.com)")
+st.caption(f"Refresh elke {refresh_minutes} min • Interval: {interval_label} • Exchange: {exchange}")
 
-        st.markdown(
-            f'<span class="pill {pill_class}">{res.sentiment}</span> '
-            f'<span class="muted"> &nbsp; {res.bias} &nbsp; • score {res.score:+.2f}</span>',
-            unsafe_allow_html=True
+# Summary row (global)
+results: Dict[str, MarketResult] = {}
+
+for name, cfg in markets_cfg.items():
+    symbol = cfg["symbol"]
+    screener = cfg["screener"]
+
+    try:
+        data = fetch_tv_analysis(symbol=symbol, exchange=exchange, screener=screener, interval=interval)
+        ind = data.get("indicators", {})
+        summ = data.get("summary", {})
+
+        score, details = compute_score(ind)
+        bias = score_to_bias(score)
+
+        tv_rec = (summ.get("RECOMMENDATION") or "—").upper()
+        last = _safe_float(ind.get("close"))
+        rsi = _safe_float(ind.get("RSI"))
+        adx = _safe_float(ind.get("ADX"))
+        vol_pct = _safe_float(details.get("vol_pct"))
+
+        results[name] = MarketResult(
+            ok=True,
+            reason="",
+            score=score,
+            bias=bias,
+            tv_rec=tv_rec,
+            last=last,
+            rsi=rsi,
+            adx=adx,
+            vol_pct=vol_pct,
+            details=details,
         )
 
-        if not res.ok:
-            st.warning("Feed error / ticker niet gevonden op deze exchange.")
-            st.caption(f"Probeerde: {res.used}")
-            if res.error:
-                st.caption(f"Error: {res.error}")
-            st.markdown("</div>", unsafe_allow_html=True)
-            continue
-
-        # Metrics
-        st.caption(f"Used: {res.used}")
-        if res.last is not None:
-            st.write(f"**Last:** {res.last}")
-        st.write(
-            f"**RSI:** {res.rsi if res.rsi is not None else '—'}  \n"
-            f"**SMA20 / SMA50:** {res.sma20 if res.sma20 is not None else '—'} / {res.sma50 if res.sma50 is not None else '—'}  \n"
-            f"**MACD hist:** {res.macd if res.macd is not None else '—'}  \n"
-            f"**TV Rec:** {res.rec if res.rec else '—'}"
+    except Exception as e:
+        results[name] = MarketResult(
+            ok=False,
+            reason=str(e),
+            score=0.0,
+            bias="NEUTRAL",
+            tv_rec="—",
+            last=None,
+            rsi=None,
+            adx=None,
+            vol_pct=None,
+            details={},
         )
 
-        st.markdown("</div>", unsafe_allow_html=True)
+# Cards grid
+cols = st.columns(3)
+i = 0
+for name, cfg in markets_cfg.items():
+    r = results[name]
+    symbol_full = tv_symbol(exchange, cfg["symbol"])
 
-st.divider()
-st.markdown("### Wat past hier nog goed bij?")
-st.markdown(
-    """
-- **Timeframe switcher (15m / 1h / 4h)** zodat je bias robuuster is  
-- **Confluence score**: meerdere timeframes samen → 1 eind-score  
-- **Risk note**: ATR/volatility indicator → “high vol / low vol”  
-- **Session filter**: London / NY open highlight  
-"""
+    with cols[i % 3]:
+        st.subheader(name)
+
+        if not r.ok:
+            st.error("Feed error")
+            st.caption("No working feed found / TA not available for deze combinatie.")
+            with st.expander("Debug (wat ging mis?)"):
+                st.code(r.reason)
+            st.caption(f"Probeer: exchange={exchange}, screener={cfg['screener']}, symbol={cfg['symbol']}")
+        else:
+            st.markdown(bias_badge(r.bias), unsafe_allow_html=True)
+            st.caption(f"Bias: {'BUY' if r.bias=='BULLISH' else ('SELL' if r.bias=='BEARISH' else 'WAIT')} • score {r.score:+.2f}")
+
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Last", f"{r.last:.5f}" if r.last is not None else "—")
+            c2.metric("RSI", f"{r.rsi:.1f}" if r.rsi is not None else "—")
+            c3.metric("ADX", f"{r.adx:.1f}" if r.adx is not None else "—")
+
+            st.caption(f"TV Rec: **{r.tv_rec}** • Volatility (ATR%): **{r.vol_pct:.2f}%**" if r.vol_pct is not None else f"TV Rec: **{r.tv_rec}**")
+
+            if show_charts:
+                tradingview_iframe(symbol_full, interval)
+
+            with st.expander("Waarom deze score?"):
+                st.write(
+                    {
+                        "Trend vs SMA20": r.details.get("trend_vs_sma20"),
+                        "Trend vs SMA50": r.details.get("trend_vs_sma50"),
+                        "RSI signal": r.details.get("rsi_signal"),
+                        "MACD hist signal": r.details.get("macd_hist_signal"),
+                        "ADX boost": r.details.get("adx_boost"),
+                        "ATR% (volatility)": r.details.get("vol_pct"),
+                    }
+                )
+
+    i += 1
+
+st.markdown("---")
+st.caption(
+    "Let op: dit is een **sentiment-indicator**, geen financieel advies. "
+    "Als TradingView TA geen data teruggeeft voor een ticker op CAPITALCOM, probeer een andere symbol-naam of screener."
 )

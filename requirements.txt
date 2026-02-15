@@ -1,5 +1,5 @@
 streamlit
-yfinance
+streamlit-autorefresh
 pandas
 numpy
-requests
+yfinance

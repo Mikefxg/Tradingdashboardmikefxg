@@ -432,15 +432,34 @@ with st.sidebar:
     st.markdown("### 🧭 EPIC map (1x instellen)")
     st.caption("Plak jouw EPICs hier (van Capital). Je zei dat je ze al hebt gevonden via 'Use this EPIC'.")
 
-    if "epics" not in st.session_state:
-        st.session_state["epics"] = {m.key: "" for m in MARKETS}
+    # --- EPIC storage persistent ---
+import json, os
 
-    for m in MARKETS:
-        st.session_state["epics"][m.key] = st.text_input(
-            f"{m.key} EPIC",
-            value=st.session_state["epics"].get(m.key, ""),
-            placeholder=m.default_epic_hint,
-        )
+EPIC_FILE = "epics.json"
+
+def load_epics():
+    if os.path.exists(EPIC_FILE):
+        with open(EPIC_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+def save_epics(data):
+    with open(EPIC_FILE, "w") as f:
+        json.dump(data, f)
+
+if "epics" not in st.session_state:
+    st.session_state["epics"] = load_epics()
+
+for m in MARKETS:
+    val = st.text_input(
+        f"{m.key} EPIC",
+        value=st.session_state["epics"].get(m.key, ""),
+        placeholder=m.default_epic_hint,
+        key=f"epic_{m.key}"
+    )
+    st.session_state["epics"][m.key] = val
+
+save_epics(st.session_state["epics"])
 
     st.markdown("---")
     st.caption("Tip: als je 429 krijgt → je logt te vaak in. Wacht 1–2 min en klik 1x op Login/Refresh.")

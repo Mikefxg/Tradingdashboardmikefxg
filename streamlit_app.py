@@ -461,8 +461,8 @@ for m in MARKETS:
 
 save_epics(st.session_state["epics"])
 
-    st.markdown("---")
-    st.caption("Tip: als je 429 krijgt → je logt te vaak in. Wacht 1–2 min en klik 1x op Login/Refresh.")
+st.markdown("---")
+st.caption("Tip: als je 429 krijgt → je logt te vaak in. Wacht 1–2 min en klik 1x op Login/Refresh.")
 
 
 # ----------------------------

@@ -1,63 +1,71 @@
-import time
-import requests
+import math
 import numpy as np
 import pandas as pd
-import yfinance as yf
 import streamlit as st
+import yfinance as yf
+from streamlit_autorefresh import st_autorefresh
 
 # =========================
-# App settings
+# UnknownFX Dashboard (CLEAN)
 # =========================
+
 st.set_page_config(page_title="UnknownFX Dashboard", layout="wide")
 
-REFRESH_SECONDS = 120  # 2 minutes
-INTERVAL = "5m"        # yfinance interval
-LOOKBACK_DAYS = "5d"   # intraday history window
+# Auto refresh elke 2 minuten (120.000 ms)
+st_autorefresh(interval=120_000, key="unknownfx_refresh")
 
-# TradingView tickers (Capital.com)
-TV_TICKERS = {
-    "US100 (Nasdaq CFD)": "CAPITALCOM:US100",
-    "US500 (S&P CFD)": "CAPITALCOM:US500",
-    "US30 (Dow CFD)": "CAPITALCOM:US30",
-    "GOLD (XAUUSD)": "CAPITALCOM:GOLD",
-    "EURUSD": "CAPITALCOM:EURUSD",
-    "DXY (Dollar Index)": "CAPITALCOM:DXY",
-}
+st.title("🚀 UnknownFX Dashboard")
+st.caption("Charts: TradingView (Capital.com) • Sentiment: price action + trend + momentum + volatility • Refresh: elke 2 min")
 
-# Price data tickers (yfinance fallback/source for calculations)
-# (These are widely supported and stable on Streamlit Cloud.)
-YF_TICKERS = {
-    "US100 (Nasdaq CFD)": "^NDX",        # Nasdaq 100 index
-    "US500 (S&P CFD)": "^GSPC",          # S&P 500 index
-    "US30 (Dow CFD)": "^DJI",            # Dow Jones
-    "GOLD (XAUUSD)": "XAUUSD=X",         # Gold spot (may work); if not, it will fallback to GC=F
-    "EURUSD": "EURUSD=X",
-    "DXY (Dollar Index)": "DX-Y.NYB",
-}
+# -------------------------
+# 1) TradingView embed helper
+# -------------------------
+def tradingview_embed(symbol: str, title: str, height: int = 420):
+    """
+    Embed TradingView Advanced Chart widget.
+    symbol voorbeeld: "CAPITALCOM:US100", "CAPITALCOM:US500", "CAPITALCOM:US30", "CAPITALCOM:GOLD", "CAPITALCOM:EURUSD", "CAPITALCOM:DXY"
+    """
+    widget = f"""
+    <div class="tradingview-widget-container">
+      <div id="tv_{symbol.replace(':','_')}"></div>
+      <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
+      <script type="text/javascript">
+      new TradingView.widget({{
+        "autosize": true,
+        "symbol": "{symbol}",
+        "interval": "15",
+        "timezone": "Etc/UTC",
+        "theme": "light",
+        "style": "1",
+        "locale": "en",
+        "toolbar_bg": "#f1f3f6",
+        "enable_publishing": false,
+        "allow_symbol_change": false,
+        "hide_top_toolbar": false,
+        "hide_legend": false,
+        "save_image": false,
+        "container_id": "tv_{symbol.replace(':','_')}"
+      }});
+      </script>
+    </div>
+    """
+    st.subheader(title)
+    st.components.v1.html(widget, height=height, scrolling=False)
 
-# =========================
-# Helpers
-# =========================
-def safe_download(ticker):
-    # yfinance intraday can fail for some tickers; try fallback for gold
-    try:
-        df = yf.download(ticker, period=LOOKBACK_DAYS, interval=INTERVAL, progress=False, auto_adjust=False)
-        if isinstance(df.columns, pd.MultiIndex):
-            # Sometimes yfinance returns multiindex columns
-            df.columns = [c[0] for c in df.columns]
-        return df
-    except Exception:
-        return pd.DataFrame()
+# -------------------------
+# 2) Indicators (sentiment engine)
+# -------------------------
+def rsi(series: pd.Series, period: int = 14) -> float:
+    delta = series.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    ma_up = up.ewm(alpha=1/period, adjust=False).mean()
+    ma_down = down.ewm(alpha=1/period, adjust=False).mean()
+    rs = ma_up / (ma_down.replace(0, np.nan))
+    val = 100 - (100 / (1 + rs))
+    return float(val.iloc[-1]) if len(val) else float("nan")
 
-def compute_rsi(close, period=14):
-    delta = close.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
-    rs = gain / (loss.replace(0, np.nan))
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-def compute_atr(df, period=14):
+def atr(df: pd.DataFrame, period: int = 14) -> float:
     high = df["High"]
     low = df["Low"]
     close = df["Close"]
@@ -67,247 +75,192 @@ def compute_atr(df, period=14):
         (high - prev_close).abs(),
         (low - prev_close).abs()
     ], axis=1).max(axis=1)
-    atr = tr.rolling(period).mean()
-    return atr
+    atr_val = tr.ewm(alpha=1/period, adjust=False).mean()
+    return float(atr_val.iloc[-1]) if len(atr_val) else float("nan")
 
-def sentiment_label(score):
-    # score roughly between -3 and +3
-    if score >= 1.0:
-        return "BULLISH"
-    if score <= -1.0:
-        return "BEARISH"
-    return "NEUTRAL"
-
-def score_market(df):
-    """
-    Score based on:
-    - EMA trend (20/50)
-    - RSI
-    - last candle direction
-    - volatility (ATR%): higher volatility -> reduce confidence
-    """
+@st.cache_data(ttl=110)  # cache iets korter dan 2 min refresh
+def fetch_ohlc(ticker: str, interval: str = "5m", period: str = "5d") -> pd.DataFrame:
+    df = yf.download(ticker, interval=interval, period=period, progress=False, auto_adjust=False)
     if df is None or df.empty:
-        return None
+        return pd.DataFrame()
+    # yfinance geeft soms kolomnamen in MultiIndex; normalize
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+    return df.dropna()
 
-    # Ensure needed columns
-    for col in ["Open", "High", "Low", "Close"]:
-        if col not in df.columns:
-            return None
+def sentiment_from_price(df: pd.DataFrame) -> dict:
+    """
+    Score op basis van:
+    - Trend: EMA20 vs EMA50
+    - Momentum: RSI
+    - Price position: close vs EMA20
+    - Volatility filter: ATR% (voor 'confidence')
+    """
+    if df.empty or len(df) < 60:
+        return {"state": "NEUTRAL", "score": 0.0, "rsi": np.nan, "atr_pct": np.nan, "last": np.nan, "ema20": np.nan, "ema50": np.nan}
 
-    df = df.dropna().copy()
-    if len(df) < 60:
-        return None
-
-    close = df["Close"]
+    close = df["Close"].astype(float)
     ema20 = close.ewm(span=20, adjust=False).mean()
     ema50 = close.ewm(span=50, adjust=False).mean()
-    rsi = compute_rsi(close, 14)
-    atr = compute_atr(df, 14)
 
-    last = df.iloc[-1]
-    last_close = float(last["Close"])
-    prev_close = float(df["Close"].iloc[-2])
+    last = float(close.iloc[-1])
+    r = rsi(close, 14)
+    a = atr(df, 14)
+    atr_pct = (a / last) * 100 if (a and last) else np.nan
 
-    # Trend component
-    trend = 0.0
+    score = 0.0
+
+    # Trend
     if ema20.iloc[-1] > ema50.iloc[-1]:
-        trend += 1.0
+        score += 1.2
+    elif ema20.iloc[-1] < ema50.iloc[-1]:
+        score -= 1.2
+
+    # Price vs EMA20
+    if last > ema20.iloc[-1]:
+        score += 0.6
     else:
-        trend -= 1.0
+        score -= 0.6
 
-    # RSI component
-    rsi_val = float(rsi.iloc[-1]) if not np.isnan(rsi.iloc[-1]) else 50.0
-    rsi_score = 0.0
-    if rsi_val >= 55:
-        rsi_score += 1.0
-    elif rsi_val <= 45:
-        rsi_score -= 1.0
+    # RSI zones
+    if r >= 60:
+        score += 0.9
+    elif r <= 40:
+        score -= 0.9
+    else:
+        # licht momentum in mid-zone
+        score += (r - 50) / 50 * 0.4  # -0.4..+0.4
 
-    # Momentum / candle
-    mom = 0.0
-    if last_close > prev_close:
-        mom += 0.5
-    elif last_close < prev_close:
-        mom -= 0.5
-
-    # Volatility penalty (ATR%)
-    atr_val = float(atr.iloc[-1]) if not np.isnan(atr.iloc[-1]) else 0.0
-    atr_pct = (atr_val / last_close) * 100 if last_close else 0.0
-
-    # If volatility is high, dampen score a bit (more "uncertain")
-    damp = 1.0
-    if atr_pct >= 0.8:
-        damp = 0.7
-    if atr_pct >= 1.2:
-        damp = 0.55
-
-    raw_score = (trend + rsi_score + mom) * damp
+    # Confidence: hoge ATR% = onrustig -> minder confident
+    # (dit verandert score niet, maar we tonen het)
+    if score >= 1.2:
+        state = "BULLISH"
+    elif score <= -1.2:
+        state = "BEARISH"
+    else:
+        state = "NEUTRAL"
 
     return {
-        "score": float(raw_score),
-        "label": sentiment_label(raw_score),
-        "last": last_close,
-        "rsi": rsi_val,
+        "state": state,
+        "score": float(score),
+        "rsi": float(r),
+        "atr_pct": float(atr_pct),
+        "last": last,
         "ema20": float(ema20.iloc[-1]),
         "ema50": float(ema50.iloc[-1]),
-        "atr_pct": float(atr_pct),
     }
 
-def tv_widget(symbol, height=380):
-    # Lightweight TradingView "symbol overview" widget
-    # Works without API keys. Uses TradingView’s embedded widget.
-    html = f"""
-    <div class="tradingview-widget-container">
-      <div id="tv_{symbol.replace(':','_')}"></div>
-      <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
-      <script type="text/javascript">
-        new TradingView.widget({{
-          "autosize": true,
-          "symbol": "{symbol}",
-          "interval": "15",
-          "timezone": "Etc/UTC",
-          "theme": "light",
-          "style": "1",
-          "locale": "en",
-          "toolbar_bg": "#f1f3f6",
-          "enable_publishing": false,
-          "hide_side_toolbar": false,
-          "allow_symbol_change": false,
-          "container_id": "tv_{symbol.replace(':','_')}"
-        }});
-      </script>
-    </div>
-    """
-    st.components.v1.html(html, height=height)
+def badge(state: str) -> str:
+    if state == "BULLISH":
+        return "🟢 BULLISH"
+    if state == "BEARISH":
+        return "🔴 BEARISH"
+    return "⚪ NEUTRAL"
 
-def send_telegram(msg):
-    # Optional: only works if you set secrets
-    token = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
-    chat_id = st.secrets.get("TELEGRAM_CHAT_ID", "")
-    if not token or not chat_id:
-        return False, "Telegram secrets not set"
+# -------------------------
+# 3) Markets config
+# -------------------------
+# TradingView symbols (Capital.com)
+TV_MARKETS = [
+    ("CAPITALCOM:US100", "US100 (Nasdaq CFD)"),
+    ("CAPITALCOM:US500", "US500 (S&P CFD)"),
+    ("CAPITALCOM:US30",  "US30 (Dow CFD)"),
+    ("CAPITALCOM:GOLD",  "GOLD (XAUUSD)"),
+    ("CAPITALCOM:EURUSD","EURUSD"),
+    ("CAPITALCOM:DXY",   "DXY (US Dollar Index)"),
+]
 
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    try:
-        r = requests.post(url, data={"chat_id": chat_id, "text": msg}, timeout=10)
-        if r.status_code == 200:
-            return True, "sent"
-        return False, f"telegram error {r.status_code}: {r.text[:120]}"
-    except Exception as e:
-        return False, str(e)
+# Data tickers (gratis proxies) voor sentiment engine
+# (zodat het zonder keys werkt)
+DATA_TICKERS = {
+    "US100 (Nasdaq CFD)": "QQQ",
+    "US500 (S&P CFD)": "SPY",
+    "US30 (Dow CFD)": "DIA",
+    "GOLD (XAUUSD)": "GC=F",
+    "EURUSD": "EURUSD=X",
+    "DXY (US Dollar Index)": "DX=F",
+}
 
-def maybe_alert(name, label, score, last):
-    # Alert when sentiment changes
-    key = f"prev_label::{name}"
-    prev = st.session_state.get(key)
-    if prev is None:
-        st.session_state[key] = label
-        return
+# -------------------------
+# 4) Top summary cards
+# -------------------------
+st.markdown("### 📌 Market Outlook (2-min refresh)")
 
-    if prev != label:
-        st.session_state[key] = label
-        msg = f"UnknownFX Alert ✅\n{name}\nSentiment: {prev} → {label}\nScore: {score:+.2f}\nLast: {last}"
-        send_telegram(msg)
+cards = st.columns(6)
+results = []
 
-@st.cache_data(ttl=REFRESH_SECONDS)
-def load_market_calc_data(name):
-    t = YF_TICKERS.get(name)
-    df = safe_download(t)
+for i, (_, name) in enumerate(TV_MARKETS):
+    data_ticker = DATA_TICKERS.get(name)
+    df = fetch_ohlc(data_ticker) if data_ticker else pd.DataFrame()
+    s = sentiment_from_price(df)
+    results.append([name, data_ticker, s["state"], s["score"], s["last"], s["rsi"], s["atr_pct"]])
 
-    # Gold fallback if XAUUSD=X fails
-    if name.startswith("GOLD") and (df is None or df.empty):
-        df = safe_download("GC=F")
+    with cards[i]:
+        st.markdown(f"**{name}**")
+        st.markdown(badge(s["state"]))
+        st.markdown(f"**Bias:** {'BUY' if s['state']=='BULLISH' else 'SELL' if s['state']=='BEARISH' else 'WAIT'}")
+        st.caption(f"score: {s['score']:+.2f}")
+        if not math.isnan(s["last"]):
+            st.caption(f"last: {s['last']:.5f}" if "EURUSD" in name else f"last: {s['last']:.2f}")
+        if not math.isnan(s["rsi"]):
+            st.caption(f"RSI: {s['rsi']:.1f}")
+        if not math.isnan(s["atr_pct"]):
+            st.caption(f"Vol (ATR%): {s['atr_pct']:.2f}%")
 
-    return df
+st.divider()
 
-# =========================
-# Header
-# =========================
-st.title("🚀 UnknownFX Dashboard")
-st.caption("MTF Confluence • Key Levels • Confidence % • Alerts • DXY Correlation • Trend Probability")
-st.caption(f"Auto refresh: every {REFRESH_SECONDS//60} min • Calc source: yfinance • Charts: TradingView (Capital.com tickers)")
+# -------------------------
+# 5) Details table
+# -------------------------
+st.markdown("### 📊 Details (sentiment engine)")
+df_out = pd.DataFrame(
+    results,
+    columns=["Market", "Proxy Ticker", "Sentiment", "Score", "Last", "RSI", "ATR%"]
+)
+st.dataframe(df_out, use_container_width=True, hide_index=True)
 
-# Auto refresh (simple + stable)
-now = int(time.time())
-st.session_state["__last_refresh__"] = st.session_state.get("__last_refresh__", now)
-if now - st.session_state["__last_refresh__"] >= REFRESH_SECONDS:
-    st.session_state["__last_refresh__"] = now
-    st.rerun()
+st.info(
+    "Let op: sentiment wordt berekend met gratis proxy-tickers (yfinance). "
+    "Charts zijn wél Capital.com op TradingView. "
+    "Wil je sentiment ook 100% op CFD/spot data? Dan heb je een broker/API key nodig."
+)
 
-# Sidebar controls
-st.sidebar.header("Settings")
-show_charts = st.sidebar.toggle("Show TradingView charts", value=True)
-enable_alerts = st.sidebar.toggle("Enable Telegram alerts", value=False)
-st.sidebar.write("Telegram werkt pas als je secrets zet.")
+st.divider()
 
-st.sidebar.divider()
-st.sidebar.write("Instrument mapping (TradingView / Calc):")
-for k in TV_TICKERS:
-    st.sidebar.write(f"- {k}: {TV_TICKERS[k]} / {YF_TICKERS[k]}")
+# -------------------------
+# 6) Charts section (TradingView Capital.com)
+# -------------------------
+st.markdown("### 📈 TradingView Charts (Capital.com)")
 
-# =========================
-# Dashboard grid
-# =========================
-names = list(TV_TICKERS.keys())
-cols = st.columns(3)
+# 2 rijen van 3 charts
+row1 = st.columns(3)
+row2 = st.columns(3)
 
-for i, name in enumerate(names):
-    with cols[i % 3]:
-        st.subheader(name)
+for idx, (tv_symbol, title) in enumerate(TV_MARKETS):
+    target = row1[idx] if idx < 3 else row2[idx - 3]
+    with target:
+        tradingview_embed(tv_symbol, title, height=420)
 
-        # 1) Calculate sentiment
-        df = load_market_calc_data(name)
-        result = score_market(df)
+st.divider()
 
-        if result is None:
-            st.error("No calc data available (yfinance).")
-        else:
-            label = result["label"]
-            score = result["score"]
+# -------------------------
+# 7) Extra: DXY correlation hint (simple)
+# -------------------------
+st.markdown("### 🔁 Extra: DXY vs EURUSD (quick bias check)")
 
-            if label == "BULLISH":
-                st.success(f"🟢 {label}")
-                bias = "BUY BIAS"
-            elif label == "BEARISH":
-                st.error(f"🔴 {label}")
-                bias = "SELL BIAS"
-            else:
-                st.warning(f"🟡 {label}")
-                bias = "NEUTRAL"
+dxy = fetch_ohlc("DX=F")
+eur = fetch_ohlc("EURUSD=X")
 
-            st.markdown(f"### {bias}")
-            st.metric("Score", f"{score:+.2f}")
-            st.write(f"Last: **{result['last']:.5f}**" if "EURUSD" in name else f"Last: **{result['last']:.2f}**")
-            st.write(f"RSI: **{result['rsi']:.1f}**")
-            st.write(f"EMA20 / EMA50: **{result['ema20']:.2f} / {result['ema50']:.2f}**")
-            st.write(f"Volatility (ATR%): **{result['atr_pct']:.2f}%**")
+if (not dxy.empty) and (not eur.empty):
+    # Align closes
+    joined = pd.concat([dxy["Close"].rename("DXY"), eur["Close"].rename("EURUSD")], axis=1).dropna()
+    if len(joined) > 50:
+        ret = joined.pct_change().dropna()
+        corr = float(ret["DXY"].corr(ret["EURUSD"]))
+        st.write(f"**Intraday return correlation (DXY vs EURUSD):** `{corr:+.2f}` (meestal negatief)")
+    else:
+        st.write("Niet genoeg data voor correlatie.")
+else:
+    st.write("Kon DXY/EURUSD proxy data niet ophalen.")
 
-            # Alerts on sentiment change
-            if enable_alerts:
-                maybe_alert(name, label, score, result["last"])
-
-        # 2) Charts
-        if show_charts:
-            with st.expander("Chart (TradingView / Capital.com)", expanded=False):
-                tv_widget(TV_TICKERS[name], height=420)
-
-# =========================
-# Footer / Telegram help
-# =========================
-with st.expander("📩 Telegram setup (optioneel)"):
-st.title("UnknownFX Dashboard")
-**Bot token krijgen:**
-1) Open Telegram → zoek **@BotFather**
-2) `/newbot` → kies naam + username
-3) BotFather geeft jou een **TOKEN** (iets als `123456:ABC...`)
-
-**Chat ID krijgen:**
-- Makkelijkste: stuur eerst een bericht naar je bot, en gebruik daarna een tool zoals **@userinfobot** om je chat_id te zien  
-  óf gebruik een eenvoudige "getUpdates" call (kan ik je ook geven als je wil).
-
-**Streamlit Cloud secrets zetten:**
-- In Streamlit Cloud → App → **Settings → Secrets**
-Plaats:
-```toml
-TELEGRAM_BOT_TOKEN="jouw_token"
-TELEGRAM_CHAT_ID="jouw_chat_id"
+st.caption("Geen financieel advies. Gebruik dit als indicatie + bevestig altijd met je eigen analysis.")

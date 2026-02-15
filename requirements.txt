@@ -1,2 +1,2 @@
 streamlit
-tradingview_ta
+tradingview-ta

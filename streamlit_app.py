@@ -1,348 +1,473 @@
-# streamlit_app.py
-from __future__ import annotations
-
-import math
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
-
 import streamlit as st
+import yfinance as yf
+import pandas as pd
+import numpy as np
 import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
+from datetime import datetime, timezone
 
-from tradingview_ta import TA_Handler, Interval  # <-- GEEN TradingViewTAError import
+# =========================================================
+# UnknownFX Dashboard
+# =========================================================
 
+st.set_page_config(page_title="UnknownFX Dashboard", layout="wide")
+st.title("📈 UnknownFX Dashboard")
+st.caption("Charts via TradingView (Capital.com) • Sentiment: TA + volatility + regime + DXY correlation")
 
-# -----------------------------
-# Config
-# -----------------------------
-st.set_page_config(page_title="Market Sentiment (TradingView x Capital.com)", layout="wide")
+# -------------------------
+# Sidebar controls
+# -------------------------
+st.sidebar.header("⚙️ Settings")
 
-DEFAULT_EXCHANGE = "CAPITALCOM"
+refresh_minutes = st.sidebar.slider("Refresh interval (minutes)", min_value=1, max_value=30, value=10, step=1)
+tf_choice = st.sidebar.selectbox("Timeframe", ["15m", "1h", "4h", "1d"], index=0)
 
-DEFAULT_MARKETS = {
-    "US100 (Nasdaq CFD)": {"symbol": "US100", "screener": "cfd"},
-    "US500 (S&P CFD)": {"symbol": "US500", "screener": "cfd"},
-    "US30 (Dow CFD)": {"symbol": "US30", "screener": "cfd"},
-    "GOLD (XAUUSD)": {"symbol": "GOLD", "screener": "cfd"},
-    "EURUSD": {"symbol": "EURUSD", "screener": "forex"},
-    "DXY (US Dollar Index)": {"symbol": "DXY", "screener": "cfd"},
+# Auto refresh
+st_autorefresh(interval=refresh_minutes * 60 * 1000, key="refresh")
+
+# Map timeframe to yfinance interval + resample
+TF_MAP = {
+    "15m": {"yf_interval": "15m", "tv_interval": "15", "resample": None, "period": "10d"},
+    "1h":  {"yf_interval": "60m", "tv_interval": "60", "resample": None, "period": "60d"},
+    "4h":  {"yf_interval": "60m", "tv_interval": "240", "resample": "4H", "period": "60d"},
+    "1d":  {"yf_interval": "1d",  "tv_interval": "D",  "resample": None, "period": "2y"},
 }
 
+tf_cfg = TF_MAP[tf_choice]
 
-# -----------------------------
-# Helpers
-# -----------------------------
-@dataclass
-class MarketResult:
-    ok: bool
-    reason: str
-    score: float
-    bias: str
-    tv_rec: str
-    last: Optional[float]
-    rsi: Optional[float]
-    adx: Optional[float]
-    vol_pct: Optional[float]
-    details: Dict[str, float]
+st.sidebar.markdown("---")
+st.sidebar.subheader("🧩 Market symbols (edit if needed)")
 
+# Default mapping based on what you shared (Capital.com labels)
+DEFAULT_MARKETS = {
+    "US100":  {"tv": "CAPITALCOM:US100",  "yf": "^NDX"},
+    "US500":  {"tv": "CAPITALCOM:US500",  "yf": "^GSPC"},
+    "US30":   {"tv": "CAPITALCOM:US30",   "yf": "^DJI"},
+    "GOLD":   {"tv": "CAPITALCOM:GOLD",   "yf": "GC=F"},        # Gold futures proxy
+    "EURUSD": {"tv": "CAPITALCOM:EURUSD", "yf": "EURUSD=X"},
+    "DXY":    {"tv": "CAPITALCOM:DXY",    "yf": "DX-Y.NYB"},
+}
 
-def _safe_float(x) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        v = float(x)
-        if math.isnan(v) or math.isinf(v):
-            return None
-        return v
-    except Exception:
-        return None
+# Editable tickers in sidebar (100% instelbaar)
+markets = {}
+for k, v in DEFAULT_MARKETS.items():
+    tv_sym = st.sidebar.text_input(f"{k} TradingView symbol", value=v["tv"])
+    yf_sym = st.sidebar.text_input(f"{k} Data ticker (yfinance)", value=v["yf"])
+    markets[k] = {"tv": tv_sym.strip(), "yf": yf_sym.strip()}
 
+st.sidebar.markdown("---")
+show_debug = st.sidebar.checkbox("Show debug panels", value=False)
 
-def compute_score(ind: Dict[str, float]) -> Tuple[float, Dict[str, float]]:
-    """
-    Score in range ~[-3, +3]
-    Based on:
-    - Price vs SMA20/SMA50 (trend)
-    - RSI (momentum)
-    - MACD histogram (momentum)
-    - ADX (trend strength) boosts trend signals
-    - ATR% (volatility proxy) shown, not used heavily in bias
-    """
-    d: Dict[str, float] = {}
+# =========================================================
+# Indicators
+# =========================================================
 
-    close = _safe_float(ind.get("close"))
-    sma20 = _safe_float(ind.get("SMA20"))
-    sma50 = _safe_float(ind.get("SMA50"))
-    rsi = _safe_float(ind.get("RSI"))
-    adx = _safe_float(ind.get("ADX"))
+def ema(series: pd.Series, span: int) -> pd.Series:
+    return series.ewm(span=span, adjust=False).mean()
 
-    macd = _safe_float(ind.get("MACD.macd"))
-    macd_signal = _safe_float(ind.get("MACD.signal"))
-    macd_hist = None
-    if macd is not None and macd_signal is not None:
-        macd_hist = macd - macd_signal
+def rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
-    atr = _safe_float(ind.get("ATR"))
-    vol_pct = None
-    if atr is not None and close is not None and close != 0:
-        vol_pct = (atr / close) * 100.0
+    avg_gain = gain.rolling(period).mean()
+    avg_loss = loss.rolling(period).mean()
 
-    score = 0.0
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
 
-    # Trend (price vs averages)
-    if close is not None and sma20 is not None:
-        s = 0.6 if close > sma20 else (-0.6 if close < sma20 else 0.0)
-        score += s
-        d["trend_vs_sma20"] = s
+def true_range(df: pd.DataFrame) -> pd.Series:
+    prev_close = df["Close"].shift(1)
+    tr = pd.concat([
+        (df["High"] - df["Low"]).abs(),
+        (df["High"] - prev_close).abs(),
+        (df["Low"] - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr
 
-    if close is not None and sma50 is not None:
-        s = 0.6 if close > sma50 else (-0.6 if close < sma50 else 0.0)
-        score += s
-        d["trend_vs_sma50"] = s
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    tr = true_range(df)
+    return tr.rolling(period).mean()
 
-    # Momentum (RSI)
-    if rsi is not None:
-        # Map RSI: 50 is neutral, >60 bullish, <40 bearish
-        if rsi >= 60:
-            s = 0.6
-        elif rsi <= 40:
-            s = -0.6
+def adx(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    # Classic ADX calculation
+    high = df["High"]
+    low = df["Low"]
+    close = df["Close"]
+
+    up_move = high.diff()
+    down_move = -low.diff()
+
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    tr = true_range(df).values
+    atr_vals = pd.Series(tr).rolling(period).mean()
+
+    plus_di = 100 * (pd.Series(plus_dm).rolling(period).mean() / atr_vals)
+    minus_di = 100 * (pd.Series(minus_dm).rolling(period).mean() / atr_vals)
+
+    dx = 100 * (abs(plus_di - minus_di) / (plus_di + minus_di).replace(0, np.nan))
+    return dx.rolling(period).mean()
+
+def macd_hist(close: pd.Series, fast=12, slow=26, signal=9) -> pd.Series:
+    macd_line = ema(close, fast) - ema(close, slow)
+    signal_line = ema(macd_line, signal)
+    return macd_line - signal_line
+
+def resample_ohlc(df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    ohlc = df.resample(rule).agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum" if "Volume" in df.columns else "sum"
+    }).dropna()
+    return ohlc
+
+# =========================================================
+# Data fetch
+# =========================================================
+
+@st.cache_data(ttl=60 * 10)  # cache 10 minutes
+def fetch_market_data(yf_symbol: str, period: str, interval: str) -> pd.DataFrame:
+    df = yf.download(yf_symbol, period=period, interval=interval, progress=False, auto_adjust=False)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.dropna()
+    # yfinance sometimes returns multiindex columns; normalize
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+    return df
+
+# =========================================================
+# Sentiment scoring
+# =========================================================
+
+def compute_signals(df: pd.DataFrame) -> dict:
+    close = df["Close"]
+    df = df.copy()
+
+    df["EMA20"] = ema(close, 20)
+    df["EMA50"] = ema(close, 50)
+    df["RSI14"] = rsi(close, 14)
+    df["ATR14"] = atr(df, 14)
+    df["ADX14"] = adx(df, 14)
+    df["MACDH"] = macd_hist(close)
+
+    latest = df.iloc[-1]
+    price = float(latest["Close"])
+    ema20v = float(latest["EMA20"])
+    ema50v = float(latest["EMA50"])
+    rsiv = float(latest["RSI14"]) if pd.notna(latest["RSI14"]) else np.nan
+    atrv = float(latest["ATR14"]) if pd.notna(latest["ATR14"]) else np.nan
+    adxv = float(latest["ADX14"]) if pd.notna(latest["ADX14"]) else np.nan
+    macdh = float(latest["MACDH"]) if pd.notna(latest["MACDH"]) else np.nan
+
+    # Slope (trend direction) via EMA20 slope over last N bars
+    n = min(10, len(df) - 1)
+    ema20_slope = float(df["EMA20"].iloc[-1] - df["EMA20"].iloc[-1 - n]) if n > 0 else 0.0
+
+    # Score components (-5..+5)
+    score = 0
+    reasons = []
+
+    # Trend stack
+    if price > ema20v and ema20v > ema50v:
+        score += 2
+        reasons.append("+2 Price>EMA20>EMA50 (uptrend stack)")
+    elif price < ema20v and ema20v < ema50v:
+        score -= 2
+        reasons.append("-2 Price<EMA20<EMA50 (downtrend stack)")
+    else:
+        reasons.append("0 Mixed EMA stack")
+
+    # RSI zone
+    if not np.isnan(rsiv):
+        if rsiv >= 60:
+            score += 1
+            reasons.append("+1 RSI>=60 (bullish momentum)")
+        elif rsiv <= 40:
+            score -= 1
+            reasons.append("-1 RSI<=40 (bearish momentum)")
         else:
-            s = (rsi - 50.0) / 20.0  # [-0.5, +0.5]
-        score += s
-        d["rsi_signal"] = s
+            reasons.append("0 RSI neutral zone")
 
-    # Momentum (MACD histogram)
-    if macd_hist is not None:
-        s = 0.6 if macd_hist > 0 else (-0.6 if macd_hist < 0 else 0.0)
-        score += s
-        d["macd_hist_signal"] = s
+    # MACD histogram
+    if not np.isnan(macdh):
+        if macdh > 0:
+            score += 1
+            reasons.append("+1 MACD hist > 0 (bullish impulse)")
+        elif macdh < 0:
+            score -= 1
+            reasons.append("-1 MACD hist < 0 (bearish impulse)")
+        else:
+            reasons.append("0 MACD hist flat")
 
-    # Trend strength boost (ADX)
-    if adx is not None:
-        # ADX >= 25 means trend is stronger -> amplify trend part a bit
-        boost = 1.0
-        if adx >= 25:
-            boost = 1.15
-        elif adx <= 15:
-            boost = 0.9
-        score *= boost
-        d["adx_boost"] = boost
+    # EMA slope
+    if ema20_slope > 0:
+        score += 1
+        reasons.append("+1 EMA20 slope up")
+    elif ema20_slope < 0:
+        score -= 1
+        reasons.append("-1 EMA20 slope down")
 
-    # Keep within a nice band
-    score = max(-3.0, min(3.0, score))
-    if vol_pct is not None:
-        d["vol_pct"] = vol_pct
+    # Volatility filter (ATR%): too high = reduce confidence
+    atr_pct = None
+    if not np.isnan(atrv) and price != 0:
+        atr_pct = (atrv / price) * 100
+        if atr_pct >= 1.2:
+            score -= 1
+            reasons.append("-1 ATR% high → reduce confidence")
+        elif atr_pct <= 0.4:
+            score += 0  # keep neutral; low vol isn't always good
+            reasons.append("0 ATR% low/normal")
 
-    return score, d
+    score = int(np.clip(score, -5, 5))
 
+    # Sentiment label + trade bias
+    if score >= 2:
+        sentiment = "BULLISH"
+        bias = "BUY BIAS"
+    elif score <= -2:
+        sentiment = "BEARISH"
+        bias = "SELL BIAS"
+    else:
+        sentiment = "NEUTRAL"
+        bias = "WAIT / NO EDGE"
 
-def score_to_bias(score: float) -> str:
-    if score >= 0.7:
-        return "BULLISH"
-    if score <= -0.7:
-        return "BEARISH"
-    return "NEUTRAL"
+    # Regime: ADX trend vs range (fallback to slope)
+    if not np.isnan(adxv):
+        regime = "TRENDING" if adxv >= 25 else "RANGING"
+    else:
+        regime = "TRENDING" if abs(ema20_slope) > 0 else "RANGING"
 
+    # Volatility label
+    vol_label = None
+    if atr_pct is not None:
+        if atr_pct >= 1.2:
+            vol_label = "HIGH"
+        elif atr_pct <= 0.4:
+            vol_label = "LOW"
+        else:
+            vol_label = "NORMAL"
 
-@st.cache_data(ttl=600)  # 10 min cache
-def fetch_tv_analysis(symbol: str, exchange: str, screener: str, interval: str) -> Dict:
-    handler = TA_Handler(
-        symbol=symbol,
-        exchange=exchange,
-        screener=screener,
-        interval=interval,
-    )
-    analysis = handler.get_analysis()
     return {
-        "summary": dict(analysis.summary) if analysis.summary else {},
-        "indicators": dict(analysis.indicators) if analysis.indicators else {},
+        "price": price,
+        "ema20": ema20v,
+        "ema50": ema50v,
+        "rsi": rsiv,
+        "adx": adxv,
+        "macdh": macdh,
+        "atr_pct": atr_pct,
+        "vol_label": vol_label,
+        "score": score,
+        "sentiment": sentiment,
+        "bias": bias,
+        "regime": regime,
+        "reasons": reasons,
     }
 
+# =========================================================
+# Sessions
+# =========================================================
 
-def tv_symbol(exchange: str, symbol: str) -> str:
-    return f"{exchange}:{symbol}"
+def session_status(now_utc: datetime) -> dict:
+    # Simple UTC-based sessions:
+    # Asia (Tokyo): 00-09 UTC
+    # London: 07-16 UTC
+    # New York: 13-22 UTC
+    h = now_utc.hour
+    asia = (0 <= h < 9)
+    london = (7 <= h < 16)
+    ny = (13 <= h < 22)
+    overlap1 = london and ny
+    overlap2 = asia and london  # small overlap
+    return {"Asia": asia, "London": london, "New York": ny, "London/NY overlap": overlap1, "Asia/London overlap": overlap2}
 
+# =========================================================
+# Header: session + refresh
+# =========================================================
 
-def tradingview_iframe(symbol_full: str, interval: str, height: int = 420) -> None:
-    # TradingView widget embed (no key needed)
-    # interval mapping to widget:
-    interval_map = {
-        Interval.INTERVAL_1_MINUTE: "1",
-        Interval.INTERVAL_5_MINUTES: "5",
-        Interval.INTERVAL_15_MINUTES: "15",
-        Interval.INTERVAL_30_MINUTES: "30",
-        Interval.INTERVAL_1_HOUR: "60",
-        Interval.INTERVAL_4_HOURS: "240",
-        Interval.INTERVAL_1_DAY: "D",
-    }
-    i = interval_map.get(interval, "15")
+now = datetime.now(timezone.utc)
+sess = session_status(now)
+
+c1, c2, c3, c4 = st.columns([1.2, 1.2, 1.2, 2])
+with c1:
+    st.metric("⏱ Refresh", f"{refresh_minutes} min", delta=f"TF: {tf_choice}")
+with c2:
+    st.metric("🕒 UTC Time", now.strftime("%H:%M"))
+with c3:
+    open_sessions = [k for k, v in sess.items() if v and "overlap" not in k]
+    st.metric("🌍 Sessions open", ", ".join(open_sessions) if open_sessions else "None")
+with c4:
+    overlaps = [k for k, v in sess.items() if v and "overlap" in k]
+    st.write("**Overlaps:**", ", ".join(overlaps) if overlaps else "—")
+
+st.markdown("---")
+
+# =========================================================
+# Main grid: 6 markets
+# =========================================================
+
+def tv_embed(symbol: str, interval: str) -> None:
+    # interval: "15", "60", "240", "D"
+    if interval == "D":
+        tv_interval = "D"
+    else:
+        tv_interval = interval
 
     html = f"""
     <iframe
-      src="https://s.tradingview.com/widgetembed/?symbol={symbol_full}&interval={i}&hidesidetoolbar=1&symboledit=0&saveimage=0&toolbarbg=f1f3f6&studies=[]&theme=light&style=1&timezone=Etc%2FUTC&withdateranges=1&hideideas=1"
-      style="width: 100%; height: {height}px; border: 0; border-radius: 12px;"
-      loading="lazy"
-    ></iframe>
+      src="https://s.tradingview.com/widgetembed/?symbol={symbol}&interval={tv_interval}&hidesidetoolbar=1&symboledit=0&saveimage=0&toolbarbg=f1f3f6&studies=[]&theme=light"
+      style="width:100%;height:360px;"
+      frameborder="0"
+      allowtransparency="true"
+      scrolling="no">
+    </iframe>
     """
-    components.html(html, height=height + 20)
+    components.html(html, height=380)
 
+def score_bar(score: int):
+    # map -5..+5 to 0..100
+    pct = int(((score + 5) / 10) * 100)
+    st.progress(pct)
+    st.caption(f"Score: **{score}** (range -5..+5)")
 
-def badge(text: str) -> str:
-    return f"<span style='padding:6px 10px;border-radius:999px;background:#f2f2f2;font-weight:700;'>{text}</span>"
-
-
-def bias_badge(bias: str) -> str:
-    if bias == "BULLISH":
-        color = "#19a34a"
-        bg = "#e9f9ef"
-    elif bias == "BEARISH":
-        color = "#d11a2a"
-        bg = "#fdecee"
-    else:
-        color = "#444"
-        bg = "#f3f4f6"
-    return f"<span style='padding:8px 12px;border-radius:999px;background:{bg};color:{color};font-weight:900;'>{bias}</span>"
-
-
-# -----------------------------
-# Sidebar settings
-# -----------------------------
-st.sidebar.header("Settings")
-
-refresh_minutes = st.sidebar.number_input("Auto refresh (minutes)", min_value=1, max_value=60, value=10, step=1)
-st_autorefresh(interval=refresh_minutes * 60 * 1000, key="auto_refresh")
-
-exchange = st.sidebar.text_input("TradingView exchange", value=DEFAULT_EXCHANGE)
-
-interval_label = st.sidebar.selectbox(
-    "Interval",
-    options=["15m", "30m", "1h", "4h", "1D"],
-    index=0,
-)
-
-interval_map = {
-    "15m": Interval.INTERVAL_15_MINUTES,
-    "30m": Interval.INTERVAL_30_MINUTES,
-    "1h": Interval.INTERVAL_1_HOUR,
-    "4h": Interval.INTERVAL_4_HOURS,
-    "1D": Interval.INTERVAL_1_DAY,
-}
-interval = interval_map[interval_label]
-
-st.sidebar.markdown("---")
-st.sidebar.subheader("Tickers (instelbaar)")
-
-markets_cfg = {}
-for name, cfg in DEFAULT_MARKETS.items():
-    sym = st.sidebar.text_input(f"{name} • symbol", value=cfg["symbol"])
-    scr = st.sidebar.selectbox(f"{name} • screener", options=["cfd", "forex"], index=(0 if cfg["screener"] == "cfd" else 1))
-    markets_cfg[name] = {"symbol": sym.strip().upper(), "screener": scr}
-
-st.sidebar.markdown("---")
-show_charts = st.sidebar.checkbox("Show charts", value=True)
-st.sidebar.caption("Tip: als je ‘Feed error’ krijgt, pas exchange/screener/symbol aan totdat TradingView TA het vindt.")
-
-# -----------------------------
-# UI
-# -----------------------------
-st.title("📈 Market Sentiment (TradingView × Capital.com)")
-st.caption(f"Refresh elke {refresh_minutes} min • Interval: {interval_label} • Exchange: {exchange}")
-
-# Summary row (global)
-results: Dict[str, MarketResult] = {}
-
-for name, cfg in markets_cfg.items():
-    symbol = cfg["symbol"]
-    screener = cfg["screener"]
-
-    try:
-        data = fetch_tv_analysis(symbol=symbol, exchange=exchange, screener=screener, interval=interval)
-        ind = data.get("indicators", {})
-        summ = data.get("summary", {})
-
-        score, details = compute_score(ind)
-        bias = score_to_bias(score)
-
-        tv_rec = (summ.get("RECOMMENDATION") or "—").upper()
-        last = _safe_float(ind.get("close"))
-        rsi = _safe_float(ind.get("RSI"))
-        adx = _safe_float(ind.get("ADX"))
-        vol_pct = _safe_float(details.get("vol_pct"))
-
-        results[name] = MarketResult(
-            ok=True,
-            reason="",
-            score=score,
-            bias=bias,
-            tv_rec=tv_rec,
-            last=last,
-            rsi=rsi,
-            adx=adx,
-            vol_pct=vol_pct,
-            details=details,
-        )
-
-    except Exception as e:
-        results[name] = MarketResult(
-            ok=False,
-            reason=str(e),
-            score=0.0,
-            bias="NEUTRAL",
-            tv_rec="—",
-            last=None,
-            rsi=None,
-            adx=None,
-            vol_pct=None,
-            details={},
-        )
-
-# Cards grid
+# Build cards
 cols = st.columns(3)
-i = 0
-for name, cfg in markets_cfg.items():
-    r = results[name]
-    symbol_full = tv_symbol(exchange, cfg["symbol"])
+market_results = {}
 
-    with cols[i % 3]:
+for idx, (name, cfg) in enumerate(markets.items()):
+    col = cols[idx % 3]
+    with col:
         st.subheader(name)
 
-        if not r.ok:
-            st.error("Feed error")
-            st.caption("No working feed found / TA not available for deze combinatie.")
-            with st.expander("Debug (wat ging mis?)"):
-                st.code(r.reason)
-            st.caption(f"Probeer: exchange={exchange}, screener={cfg['screener']}, symbol={cfg['symbol']}")
+        df = fetch_market_data(cfg["yf"], period=tf_cfg["period"], interval=tf_cfg["yf_interval"])
+
+        if df.empty or len(df) < 60:
+            st.error("No data / too little history from data feed.")
+            if show_debug:
+                st.info(f"yfinance symbol: {cfg['yf']}")
+            tv_embed(cfg["tv"], tf_cfg["tv_interval"])
+            continue
+
+        # If 4h requested, resample
+        if tf_cfg["resample"]:
+            try:
+                df = df.copy()
+                # Ensure datetime index is tz-aware-ish; yfinance index is typically tz-naive
+                df.index = pd.to_datetime(df.index)
+                df = resample_ohlc(df, tf_cfg["resample"])
+            except Exception as e:
+                st.warning("Resample failed; using base timeframe.")
+                if show_debug:
+                    st.write(e)
+
+        sig = compute_signals(df)
+        market_results[name] = {"df": df, "sig": sig}
+
+        # Sentiment badge
+        if sig["sentiment"] == "BULLISH":
+            st.success("🟢 BULLISH")
+        elif sig["sentiment"] == "BEARISH":
+            st.error("🔴 BEARISH")
         else:
-            st.markdown(bias_badge(r.bias), unsafe_allow_html=True)
-            st.caption(f"Bias: {'BUY' if r.bias=='BULLISH' else ('SELL' if r.bias=='BEARISH' else 'WAIT')} • score {r.score:+.2f}")
+            st.warning("⚪ NEUTRAL")
 
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Last", f"{r.last:.5f}" if r.last is not None else "—")
-            c2.metric("RSI", f"{r.rsi:.1f}" if r.rsi is not None else "—")
-            c3.metric("ADX", f"{r.adx:.1f}" if r.adx is not None else "—")
+        st.write(f"**Bias:** {sig['bias']}")
+        score_bar(sig["score"])
 
-            st.caption(f"TV Rec: **{r.tv_rec}** • Volatility (ATR%): **{r.vol_pct:.2f}%**" if r.vol_pct is not None else f"TV Rec: **{r.tv_rec}**")
+        # Quick stats
+        cA, cB, cC = st.columns(3)
+        with cA:
+            st.metric("Last", f"{sig['price']:.5f}" if sig["price"] < 10 else f"{sig['price']:.2f}")
+        with cB:
+            st.metric("Regime", sig["regime"])
+        with cC:
+            if sig["atr_pct"] is not None:
+                st.metric("Vol (ATR%)", f"{sig['atr_pct']:.2f}% ({sig['vol_label']})")
+            else:
+                st.metric("Vol (ATR%)", "—")
 
-            if show_charts:
-                tradingview_iframe(symbol_full, interval)
+        # Breakdown (optional)
+        if show_debug:
+            with st.expander("Why this score?"):
+                for r in sig["reasons"]:
+                    st.write(r)
+                st.write("RSI:", sig["rsi"])
+                st.write("EMA20:", sig["ema20"])
+                st.write("EMA50:", sig["ema50"])
+                st.write("ADX:", sig["adx"])
+                st.write("MACD hist:", sig["macdh"])
+                st.write("TV symbol:", cfg["tv"])
+                st.write("Data ticker:", cfg["yf"])
 
-            with st.expander("Waarom deze score?"):
-                st.write(
-                    {
-                        "Trend vs SMA20": r.details.get("trend_vs_sma20"),
-                        "Trend vs SMA50": r.details.get("trend_vs_sma50"),
-                        "RSI signal": r.details.get("rsi_signal"),
-                        "MACD hist signal": r.details.get("macd_hist_signal"),
-                        "ADX boost": r.details.get("adx_boost"),
-                        "ATR% (volatility)": r.details.get("vol_pct"),
-                    }
-                )
-
-    i += 1
+        # TradingView chart
+        tv_embed(cfg["tv"], tf_cfg["tv_interval"])
 
 st.markdown("---")
-st.caption(
-    "Let op: dit is een **sentiment-indicator**, geen financieel advies. "
-    "Als TradingView TA geen data teruggeeft voor een ticker op CAPITALCOM, probeer een andere symbol-naam of screener."
+
+# =========================================================
+# DXY movement + Correlation section
+# =========================================================
+
+st.header("💵 DXY Movement & Correlations")
+
+if "DXY" in market_results and market_results["DXY"]["df"] is not None:
+    dxy_df = market_results["DXY"]["df"].copy()
+    dxy_df["ret"] = dxy_df["Close"].pct_change()
+
+    # Show DXY direction (last N bars)
+    lookback = 12 if tf_choice in ["15m", "1h"] else 20
+    lookback = min(lookback, len(dxy_df) - 1)
+    dxy_move = (dxy_df["Close"].iloc[-1] / dxy_df["Close"].iloc[-1 - lookback] - 1) * 100 if lookback > 0 else 0
+
+    st.metric("DXY change (recent)", f"{dxy_move:.2f}%")
+
+    # Correlations with indices
+    corr_markets = ["US100", "US500", "US30"]
+    rows = []
+    for m in corr_markets:
+        if m in market_results:
+            dfm = market_results[m]["df"].copy()
+            dfm["ret"] = dfm["Close"].pct_change()
+
+            joined = pd.concat([dxy_df["ret"], dfm["ret"]], axis=1).dropna()
+            joined.columns = ["dxy_ret", "m_ret"]
+
+            if len(joined) >= 30:
+                rolling = joined["dxy_ret"].rolling(30).corr(joined["m_ret"])
+                corr_now = float(rolling.iloc[-1]) if pd.notna(rolling.iloc[-1]) else np.nan
+                rows.append({"Market": m, "Rolling Corr (30 bars)": corr_now})
+            else:
+                rows.append({"Market": m, "Rolling Corr (30 bars)": np.nan})
+
+    corr_table = pd.DataFrame(rows)
+    st.dataframe(corr_table, use_container_width=True)
+
+    st.caption("Tip: vaak is DXY negatief gecorreleerd met indices. Als DXY hard stijgt, kan risk-off toenemen.")
+
+else:
+    st.warning("DXY data not available. Check your yfinance ticker for DXY (default: DX-Y.NYB).")
+
+st.markdown("---")
+
+# =========================================================
+# “What fits here?” section (practical extras)
+# =========================================================
+
+st.header("✅ What else fits well for trading decisions?")
+
+st.markdown(
+    """
+**Aanraders (super nuttig in praktijk):**
+- **Multi-timeframe confluence**: laat 15m + 1h + 4h tegelijk een score geven → “aligned” of “mixed”.
+- **Key levels / pivots**: yesterday high/low + weekly open + session highs.
+- **Risk mode**: als volatility HIGH is, verlaag score confidence of zet “WAIT”.
+- **Alerts**: score crossing (bijv. van -1 naar -2 = SELL bias trigger).
+"""
 )
+
+st.caption("Let op: dit is een indicatie-dashboard, geen financieel advies.")
+

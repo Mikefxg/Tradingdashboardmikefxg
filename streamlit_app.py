@@ -295,7 +295,7 @@ for i, name in enumerate(names):
 # Footer / Telegram help
 # =========================
 with st.expander("📩 Telegram setup (optioneel)"):
-    st.markdown("""
+st.title("UnknownFX Dashboard")
 **Bot token krijgen:**
 1) Open Telegram → zoek **@BotFather**
 2) `/newbot` → kies naam + username

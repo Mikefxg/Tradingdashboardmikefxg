@@ -1,625 +1,685 @@
+# streamlit_app.py
+# UnknownFX Dashboard — PRO+++ (Capital.com candles + TradingView charts) — NO STOOQ
+# Public mode: sidebar hidden (visitors)
+# Admin mode: sidebar visible (EPIC setup + Capital login tools)
+#
+# Secrets required (Streamlit Cloud -> App -> Settings -> Secrets):
+#   CAPITAL_API_KEY = "..."
+#   CAPITAL_IDENTIFIER = "your@email.com"
+#   CAPITAL_PASSWORD = "yourPassword"
+#   CAPITAL_API_BASE = "https://demo-api-capital.backend-capital.com"   # demo
+#   # or live base: "https://api-capital.backend-capital.com"
+#   ADMIN_PASSWORD = "set-a-strong-admin-password"
+
+from __future__ import annotations
+
+import json
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple, Any, List
 
-import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
 
-# ----------------------------
+# =========================
 # App config
-# ----------------------------
+# =========================
 st.set_page_config(
     page_title="UnknownFX Dashboard",
-    page_icon="🚀",
+    page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
-APP_TITLE = "🚀 UnknownFX Dashboard"
-APP_SUBTITLE = "Institutional view • Capital.com candles • TradingView charts • MTF confluence • Auto refresh"
+EPICS_FILE = "epics.json"
+
+# TradingView interval mapping (string -> TradingView interval)
+TV_INTERVALS = {
+    "1m": "1",
+    "5m": "5",
+    "15m": "15",
+    "30m": "30",
+    "1h": "60",
+    "4h": "240",
+    "1D": "D",
+}
+
+# Capital.com resolution mapping (string -> Capital resolution)
+CAP_RES = {
+    "1m": "MINUTE",
+    "5m": "MINUTE_5",
+    "15m": "MINUTE_15",
+    "30m": "MINUTE_30",
+    "1h": "HOUR",
+    "4h": "HOUR_4",
+    "1D": "DAY",
+}
 
 
-# ----------------------------
+@dataclass(frozen=True)
+class Market:
+    key: str
+    label: str
+    tv_symbol: str          # TradingView symbol
+    epic_hint: str          # hint only, user fills actual Capital EPIC
+
+
+MARKETS: List[Market] = [
+    Market("US100", "US Tech 100", "CAPITALCOM:USTECH100", "bv. 'USTECH100' EPIC van Capital"),
+    Market("US500", "US 500",      "CAPITALCOM:US500",     "bv. 'US500' EPIC van Capital"),
+    Market("GOLD",  "Gold (XAUUSD)","CAPITALCOM:GOLD",     "bv. 'GOLD' / 'XAUUSD' EPIC van Capital"),
+    Market("EURUSD","EURUSD",      "CAPITALCOM:EURUSD",   "bv. 'EURUSD' EPIC van Capital"),
+    Market("DXY",   "DXY",         "CAPITALCOM:DXY",      "bv. 'DXY' EPIC van Capital"),
+]
+
+
+# =========================
 # Styling (institutional look)
-# ----------------------------
+# =========================
 st.markdown(
     """
 <style>
-/* Layout polish */
-.block-container { padding-top: 1.25rem; padding-bottom: 2rem; }
-h1, h2, h3 { letter-spacing: 0.2px; }
-.small-muted { opacity: 0.78; font-size: 0.95rem; }
+/* Page background */
+.main {background: radial-gradient(1200px 800px at 10% 10%, rgba(60,80,120,.15), transparent 60%),
+                    radial-gradient(1000px 600px at 90% 0%, rgba(120,60,80,.10), transparent 55%);
+      }
+.block-container {padding-top: 1.2rem; padding-bottom: 2.5rem;}
 
-/* Card look */
+/* Header */
+.ufx-header {
+  display:flex; align-items:center; justify-content:space-between;
+  padding: 14px 18px; border-radius: 16px;
+  background: rgba(20, 24, 32, 0.65);
+  border: 1px solid rgba(255,255,255,0.08);
+  box-shadow: 0 10px 30px rgba(0,0,0,.22);
+  backdrop-filter: blur(12px);
+}
+.ufx-title {font-size: 28px; font-weight: 800; letter-spacing: .3px;}
+.ufx-sub {opacity: .70; font-size: 13px; margin-top: 2px;}
+.ufx-badge {
+  padding: 6px 10px; border-radius: 999px;
+  background: rgba(0, 180, 120, .16);
+  border: 1px solid rgba(0, 180, 120, .30);
+  font-weight: 700; font-size: 12px;
+}
+
+/* Cards */
 .card {
-  border: 1px solid rgba(255,255,255,0.10);
-  background: rgba(255,255,255,0.03);
+  padding: 14px 14px;
   border-radius: 16px;
-  padding: 16px 16px;
+  background: rgba(20, 24, 32, 0.55);
+  border: 1px solid rgba(255,255,255,0.08);
+  box-shadow: 0 10px 30px rgba(0,0,0,.18);
+  backdrop-filter: blur(10px);
+  height: 100%;
 }
-.card-title { font-size: 0.95rem; opacity: 0.85; margin-bottom: 6px; }
-.card-big { font-size: 1.8rem; font-weight: 700; }
-.card-sub { font-size: 0.95rem; opacity: 0.8; }
+.card-title {font-size: 12px; opacity:.70; margin-bottom: 6px;}
+.card-value {font-size: 20px; font-weight: 800; letter-spacing: .2px;}
+.card-sub {font-size: 12px; opacity:.70; margin-top: 6px;}
 
-/* Badges */
-.badge {
-  display:inline-block; padding: 6px 10px; border-radius: 999px;
-  font-weight: 700; font-size: 0.85rem; letter-spacing: 0.3px;
-  border: 1px solid rgba(255,255,255,0.10);
-}
-.badge-bull { background: rgba(34,197,94,0.15); color: rgb(134,239,172); }
-.badge-bear { background: rgba(239,68,68,0.15); color: rgb(252,165,165); }
-.badge-neutral { background: rgba(234,179,8,0.15); color: rgb(253,230,138); }
-
-/* Divider */
-.hr { height: 1px; background: rgba(255,255,255,0.08); margin: 14px 0; }
-
-/* TradingView wrapper */
+/* TradingView container */
 .tv-wrap {
-  border: 1px solid rgba(255,255,255,0.10);
-  background: rgba(0,0,0,0.10);
-  border-radius: 16px;
+  border-radius: 18px;
   overflow: hidden;
+  border: 1px solid rgba(255,255,255,0.08);
+  box-shadow: 0 14px 40px rgba(0,0,0,.22);
 }
+
+/* Hide Streamlit footer/menu */
+#MainMenu {visibility:hidden;}
+footer {visibility:hidden;}
 </style>
 """,
     unsafe_allow_html=True,
 )
 
 
-# ----------------------------
-# Auto refresh without extra packages (no streamlit_autorefresh)
-# ----------------------------
-def inject_auto_refresh(enabled: bool, seconds: int) -> None:
-    if enabled and seconds >= 10:
-        st.markdown(
-            f"""<meta http-equiv="refresh" content="{int(seconds)}">""",
-            unsafe_allow_html=True,
-        )
-
-
-# ----------------------------
-# Market config
-# ----------------------------
-@dataclass
-class Market:
-    key: str
-    label: str
-    tv_symbol: str  # TradingView symbol
-    default_epic_hint: str  # shown to user
-    asset_class: str
-
-
-MARKETS: List[Market] = [
-    Market("US100", "US 100 (Nasdaq)", "CAPITALCOM:US100", "Zoek: US 100 / US100", "Index"),
-    Market("US500", "US 500 (S&P 500)", "CAPITALCOM:US500", "Zoek: US 500 / US500", "Index"),
-    Market("GOLD", "Gold (XAUUSD)", "CAPITALCOM:GOLD", "Zoek: Gold / XAUUSD", "Commodity"),
-    Market("DXY", "US Dollar Index (DXY)", "CAPITALCOM:DXY", "Zoek: DXY / Dollar Index", "Index"),
-    Market("EURUSD", "EURUSD", "CAPITALCOM:EURUSD", "Zoek: EURUSD", "FX"),
-]
-
-TV_INTERVALS = {
-    "1": "1",
-    "5": "5",
-    "15": "15",
-    "60": "60",
-    "240": "240",
-    "1D": "D",
-}
-
-CAPITAL_RESOLUTION_MAP = {
-    "1": "MINUTE",
-    "5": "MINUTE_5",
-    "15": "MINUTE_15",
-    "60": "HOUR",
-    "240": "HOUR_4",
-    "1D": "DAY",
-}
-
-
-# ----------------------------
-# Secrets helpers
-# ----------------------------
-def get_secret(name: str) -> Optional[str]:
-    # Works on Streamlit Cloud + local (if you provide .streamlit/secrets.toml)
+# =========================
+# Helpers: EPIC storage
+# =========================
+def load_epics() -> Dict[str, str]:
     try:
-        return st.secrets.get(name)
+        with open(EPICS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {k: str(v) for k, v in data.items()}
     except Exception:
-        return None
+        pass
+    return {m.key: "" for m in MARKETS}
 
 
-def required_capital_secrets_present() -> Tuple[bool, List[str]]:
-    missing = []
-    for k in ["CAPITAL_API_KEY", "CAPITAL_IDENTIFIER", "CAPITAL_PASSWORD", "CAPITAL_API_BASE"]:
-        if not get_secret(k):
-            missing.append(k)
-    return (len(missing) == 0), missing
+def save_epics(epics: Dict[str, str]) -> None:
+    try:
+        with open(EPICS_FILE, "w", encoding="utf-8") as f:
+            json.dump(epics, f, indent=2)
+    except Exception:
+        # On Streamlit Cloud, writing is usually fine inside repo runtime.
+        # If it fails, we still keep it in session_state.
+        pass
 
 
-# ----------------------------
-# Capital.com API
-# ----------------------------
-def capital_login(force: bool = False) -> Tuple[bool, str]:
+# =========================
+# Public/Admin mode
+# =========================
+def is_admin() -> bool:
+    # URL param ?admin=1 makes admin available (for you)
+    qp = st.query_params
+    if str(qp.get("admin", "")).lower() in ("1", "true", "yes"):
+        st.session_state["is_admin"] = True
+
+    if "is_admin" not in st.session_state:
+        st.session_state["is_admin"] = False
+
+    if not st.session_state["is_admin"]:
+        # Minimal login (appears ONLY if sidebar still visible; we’ll hide sidebar after this block)
+        with st.sidebar:
+            st.markdown("### 🔒 Admin login")
+            pw = st.text_input("Password", type="password")
+            if st.button("Login"):
+                if pw and pw == st.secrets.get("ADMIN_PASSWORD", ""):
+                    st.session_state["is_admin"] = True
+                    st.rerun()
+                else:
+                    st.error("Wrong password")
+    return bool(st.session_state["is_admin"])
+
+
+ADMIN = is_admin()
+
+# Hide sidebar for public visitors
+if not ADMIN:
+    st.markdown(
+        """
+        <style>
+          section[data-testid="stSidebar"] {display:none !important;}
+          div[data-testid="collapsedControl"] {display:none !important;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# =========================
+# Capital.com API client
+# =========================
+def _secrets_get(key: str) -> str:
+    v = st.secrets.get(key, "")
+    return str(v).strip()
+
+
+def capital_required_secrets_ok() -> Tuple[bool, List[str]]:
+    needed = ["CAPITAL_API_KEY", "CAPITAL_IDENTIFIER", "CAPITAL_PASSWORD", "CAPITAL_API_BASE"]
+    missing = [k for k in needed if not _secrets_get(k)]
+    return (len(missing) == 0, missing)
+
+
+def capital_login(force: bool = False) -> Tuple[bool, Dict[str, Any]]:
     """
-    Logs in once and stores CST + X-SECURITY-TOKEN in st.session_state.
-    Avoids repeated login to prevent 429.
+    Returns (success, info). On success, saves tokens in session_state.
+    Tokens: CST, X-SECURITY-TOKEN
     """
-    ok, missing = required_capital_secrets_present()
+    ok, missing = capital_required_secrets_ok()
     if not ok:
-        return False, f"Missing secrets: {', '.join(missing)}"
+        return False, {"error": "Missing secrets", "missing": missing}
 
-    # Reuse existing token (55 minutes)
-    token = st.session_state.get("capital_token", {})
-    age = time.time() - float(token.get("ts", 0) or 0)
-    token_ok = bool(token.get("cst")) and bool(token.get("xst")) and age < 55 * 60
+    # Throttle login attempts (avoid 429)
+    now = time.time()
+    cooldown_until = st.session_state.get("capital_login_cooldown_until", 0.0)
+    if now < cooldown_until and not force:
+        return False, {"error": "Cooldown (429 protection)", "retry_in_sec": int(cooldown_until - now)}
 
-    if token_ok and not force:
-        return True, "Already logged in (cached token)."
+    # Reuse tokens if fresh (20 min)
+    token = st.session_state.get("capital_token")
+    if token and not force:
+        age = now - float(token.get("ts", 0))
+        if age < 20 * 60 and token.get("cst") and token.get("xst"):
+            return True, {"status": "reused", "age_sec": int(age)}
 
-    base = get_secret("CAPITAL_API_BASE").rstrip("/")
+    base = _secrets_get("CAPITAL_API_BASE").rstrip("/")
     url = f"{base}/api/v1/session"
+    api_key = _secrets_get("CAPITAL_API_KEY")
+    identifier = _secrets_get("CAPITAL_IDENTIFIER")
+    password = _secrets_get("CAPITAL_PASSWORD")
 
     headers = {
-        "X-CAP-API-KEY": get_secret("CAPITAL_API_KEY"),
+        "X-CAP-API-KEY": api_key,
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
     payload = {
-        "identifier": get_secret("CAPITAL_IDENTIFIER"),
-        "password": get_secret("CAPITAL_PASSWORD"),
+        "identifier": identifier,
+        "password": password,
         "encryptedPassword": False,
     }
 
     try:
-        r = requests.post(url, headers=headers, json=payload, timeout=20)
+        r = requests.post(url, headers=headers, json=payload, timeout=15)
     except Exception as e:
-        return False, f"Network error during login: {e}"
+        return False, {"error": "Network error", "detail": str(e), "url": url}
 
-    # Rate limit / auth handling
+    cst = r.headers.get("CST")
+    xst = r.headers.get("X-SECURITY-TOKEN")
+
     try:
         body = r.json()
     except Exception:
         body = {"raw": r.text}
 
-    cst = r.headers.get("CST")
-    xst = r.headers.get("X-SECURITY-TOKEN")
-
-    if 200 <= r.status_code < 300 and cst and xst:
-        st.session_state["capital_token"] = {"cst": cst, "xst": xst, "ts": time.time(), "base": base}
-        return True, "Capital login OK ✅"
-
-    # Common errors: 401, 400, 429
+    # Handle rate limit
     if r.status_code == 429:
-        return False, "Capital login blocked (429 too many requests). Wacht 1–2 minuten en klik opnieuw."
-    return False, f"Capital login failed ({r.status_code}): {body}"
+        st.session_state["capital_login_cooldown_until"] = time.time() + 90  # 1.5 min cooldown
+        return False, {"status": 429, "body": body, "url": url, "note": "Too many requests. Wait 1-2 min."}
+
+    # Success criteria: 2xx and tokens exist
+    if 200 <= r.status_code < 300 and cst and xst:
+        st.session_state["capital_token"] = {
+            "cst": cst,
+            "xst": xst,
+            "ts": time.time(),
+            "base": base,
+        }
+        return True, {"status": r.status_code, "body": body, "url": url}
+
+    return False, {
+        "status": r.status_code,
+        "body": body,
+        "got_CST": bool(cst),
+        "got_X_SECURITY_TOKEN": bool(xst),
+        "url": url,
+    }
 
 
-def capital_headers() -> Tuple[bool, Dict[str, str], str]:
-    token = st.session_state.get("capital_token", {})
-    if not token.get("cst") or not token.get("xst"):
-        return False, {}, "No active Capital session. Click 'Login / Refresh'."
-
-    headers = {
-        "X-CAP-API-KEY": get_secret("CAPITAL_API_KEY"),
-        "CST": token["cst"],
-        "X-SECURITY-TOKEN": token["xst"],
+def capital_headers() -> Dict[str, str]:
+    token = st.session_state.get("capital_token") or {}
+    api_key = _secrets_get("CAPITAL_API_KEY")
+    return {
+        "X-CAP-API-KEY": api_key,
+        "CST": token.get("cst", ""),
+        "X-SECURITY-TOKEN": token.get("xst", ""),
         "Accept": "application/json",
     }
-    return True, headers, "OK"
 
 
-@st.cache_data(ttl=25)  # light caching to reduce calls
-def capital_search_markets(base: str, headers: Dict[str, str], term: str) -> Dict:
-    url = f"{base}/api/v1/markets"
-    r = requests.get(url, headers=headers, params={"searchTerm": term}, timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-
-@st.cache_data(ttl=20)
-def capital_get_prices(base: str, headers: Dict[str, str], epic: str, resolution: str, max_points: int = 200) -> pd.DataFrame:
+def fetch_candles(epic: str, timeframe_key: str, max_points: int = 300) -> Tuple[bool, Any]:
     """
-    Gets candles from Capital. Returns DataFrame with datetime index and OHLC.
+    Uses Capital /api/v1/prices/{epic}?resolution=...&max=...
+    Returns (success, df_or_error)
     """
+    token = st.session_state.get("capital_token")
+    if not token:
+        ok, info = capital_login(force=False)
+        if not ok:
+            return False, info
+        token = st.session_state.get("capital_token")
+
+    base = (token.get("base") or _secrets_get("CAPITAL_API_BASE")).rstrip("/")
+    resolution = CAP_RES.get(timeframe_key, "MINUTE_15")
     url = f"{base}/api/v1/prices/{epic}"
-    params = {"resolution": resolution, "max": max_points}
-    r = requests.get(url, headers=headers, params=params, timeout=25)
-    r.raise_for_status()
-    j = r.json()
+    params = {"resolution": resolution, "max": int(max_points)}
 
-    prices = j.get("prices", [])
+    try:
+        r = requests.get(url, headers=capital_headers(), params=params, timeout=15)
+    except Exception as e:
+        return False, {"error": "Network error", "detail": str(e), "url": url}
+
+    # If unauthorized/expired -> try relogin once
+    if r.status_code in (401, 403):
+        ok, info = capital_login(force=True)
+        if not ok:
+            return False, {"error": "Login refresh failed", "login": info}
+        r = requests.get(url, headers=capital_headers(), params=params, timeout=15)
+
+    if r.status_code == 429:
+        return False, {"error": "429 too many requests", "url": url, "hint": "Increase refresh interval."}
+
+    try:
+        data = r.json()
+    except Exception:
+        data = {"raw": r.text}
+
+    if not (200 <= r.status_code < 300):
+        return False, {"status": r.status_code, "body": data, "url": url}
+
+    prices = data.get("prices") or []
     if not prices:
-        return pd.DataFrame()
+        return False, {"error": "No prices returned", "body": data, "url": url}
 
     rows = []
     for p in prices:
-        snap = p.get("snapshotTimeUTC") or p.get("snapshotTime")
+        snap = p.get("snapshotTimeUTC") or p.get("snapshotTime") or ""
         o = p.get("openPrice", {})
+        c = p.get("closePrice", {})
         h = p.get("highPrice", {})
         l = p.get("lowPrice", {})
-        c = p.get("closePrice", {})
-
-        def mid(x: dict) -> Optional[float]:
-            # Capital sometimes gives bid/ask
-            if "mid" in x and x["mid"] is not None:
-                return float(x["mid"])
-            if "bid" in x and "ask" in x and x["bid"] is not None and x["ask"] is not None:
-                return (float(x["bid"]) + float(x["ask"])) / 2.0
+        # Prefer bid/ask mid if available, else fallback
+        def mid(x):
+            if x is None:
+                return None
+            bid = x.get("bid")
+            ask = x.get("ask")
+            if bid is not None and ask is not None:
+                return (float(bid) + float(ask)) / 2.0
+            if bid is not None:
+                return float(bid)
+            if ask is not None:
+                return float(ask)
             return None
 
-        row = {
-            "time": snap,
-            "open": mid(o),
-            "high": mid(h),
-            "low": mid(l),
-            "close": mid(c),
-        }
-        if row["close"] is not None and row["open"] is not None:
-            rows.append(row)
+        rows.append(
+            {
+                "time": snap,
+                "open": mid(o),
+                "high": mid(h),
+                "low": mid(l),
+                "close": mid(c),
+            }
+        )
 
     df = pd.DataFrame(rows)
+    # Parse time
+    df["time"] = pd.to_datetime(df["time"], errors="coerce", utc=True)
+    df = df.dropna(subset=["time"]).sort_values("time")
+    df = df.dropna(subset=["close"])
     if df.empty:
-        return df
-
-    df["time"] = pd.to_datetime(df["time"], utc=True, errors="coerce")
-    df = df.dropna(subset=["time", "open", "high", "low", "close"]).sort_values("time")
-    df = df.set_index("time")
-    return df
+        return False, {"error": "Parsed DF is empty", "body": data}
+    return True, df
 
 
-# ----------------------------
-# Indicators
-# ----------------------------
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    up = delta.clip(lower=0.0)
-    down = (-delta).clip(lower=0.0)
-    roll_up = up.ewm(alpha=1 / period, adjust=False).mean()
-    roll_down = down.ewm(alpha=1 / period, adjust=False).mean()
-    rs = roll_up / roll_down.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
+def compute_rsi(close: pd.Series, period: int = 14) -> float:
+    if len(close) < period + 2:
+        return float("nan")
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0.0).rolling(period).mean()
+    loss = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
+    rs = gain / loss.replace(0, pd.NA)
+    rsi = 100 - (100 / (1 + rs))
+    return float(rsi.iloc[-1])
 
 
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+def compute_atr_pct(df: pd.DataFrame, period: int = 14) -> float:
+    if len(df) < period + 2:
+        return float("nan")
     high = df["high"]
     low = df["low"]
     close = df["close"]
     prev_close = close.shift(1)
-    tr = pd.concat([(high - low), (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
-    return tr.ewm(alpha=1 / period, adjust=False).mean()
+    tr = pd.concat(
+        [
+            (high - low),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr = tr.rolling(period).mean().iloc[-1]
+    last = close.iloc[-1]
+    if last == 0 or pd.isna(last) or pd.isna(atr):
+        return float("nan")
+    return float((atr / last) * 100.0)
 
 
-def bias_from_indicators(df: pd.DataFrame) -> Dict[str, float]:
-    """
-    Returns RSI, SMA20, SMA50, ATR% and a simple bias score.
-    """
-    close = df["close"]
-    sma20 = close.rolling(20).mean()
-    sma50 = close.rolling(50).mean()
-    r = rsi(close, 14)
-    a = atr(df, 14)
-    atr_pct = (a / close) * 100.0
-
-    last = df.iloc[-1]
-    last_close = float(last["close"])
-    last_sma20 = float(sma20.iloc[-1]) if not np.isnan(sma20.iloc[-1]) else np.nan
-    last_sma50 = float(sma50.iloc[-1]) if not np.isnan(sma50.iloc[-1]) else np.nan
-    last_rsi = float(r.iloc[-1]) if not np.isnan(r.iloc[-1]) else np.nan
-    last_atr_pct = float(atr_pct.iloc[-1]) if not np.isnan(atr_pct.iloc[-1]) else np.nan
-
-    score = 0
-    if not np.isnan(last_sma20) and last_close > last_sma20:
-        score += 1
-    if not np.isnan(last_sma50) and last_close > last_sma50:
-        score += 1
-    if not np.isnan(last_rsi) and last_rsi >= 55:
-        score += 1
-    if not np.isnan(last_rsi) and last_rsi <= 45:
-        score -= 1
-    if not np.isnan(last_sma20) and not np.isnan(last_sma50) and last_sma20 < last_sma50:
-        score -= 1
-
-    return {
-        "close": last_close,
-        "rsi": last_rsi,
-        "sma20": last_sma20,
-        "sma50": last_sma50,
-        "atr_pct": last_atr_pct,
-        "score": float(score),
-    }
-
-
-def score_to_label(score: float) -> Tuple[str, str]:
-    if score >= 2:
-        return "BULLISH", "badge badge-bull"
-    if score <= -2:
-        return "BEARISH", "badge badge-bear"
-    return "NEUTRAL", "badge badge-neutral"
-
-
-def mtf_verdict(scores: Dict[str, float]) -> Tuple[str, str]:
-    """
-    scores keys: "15", "60", "240", "1D" -> score
-    """
-    bull = sum(1 for s in scores.values() if s >= 2)
-    bear = sum(1 for s in scores.values() if s <= -2)
-    if bull >= 3:
-        return "MTF: BULLISH BIAS", "badge badge-bull"
-    if bear >= 3:
-        return "MTF: BEARISH BIAS", "badge badge-bear"
-    return "MTF: MIXED / WAIT", "badge badge-neutral"
-
-
-# ----------------------------
-# TradingView embed
-# ----------------------------
-def tradingview_advanced_chart(symbol: str, interval: str, height: int = 620) -> str:
-    # interval must be "1", "5", "15", "60", "240" or "D"
-    interval_tv = TV_INTERVALS.get(interval, "15")
-    return f"""
+# =========================
+# TradingView embed (BIGGER)
+# =========================
+def tradingview_embed(symbol: str, interval: str, height: int = 760) -> None:
+    # Bigger chart: 760px default
+    html = f"""
 <div class="tv-wrap">
   <div class="tradingview-widget-container">
-    <div id="tv_{symbol.replace(':','_')}"></div>
+    <div id="tv_chart"></div>
     <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
     <script type="text/javascript">
       new TradingView.widget({{
-        "autosize": true,
+        "autosize": false,
+        "width": "100%",
+        "height": {height},
         "symbol": "{symbol}",
-        "interval": "{interval_tv}",
+        "interval": "{interval}",
         "timezone": "Etc/UTC",
         "theme": "dark",
         "style": "1",
         "locale": "en",
-        "enable_publishing": false,
-        "hide_top_toolbar": false,
-        "hide_legend": false,
+        "hide_side_toolbar": false,
+        "allow_symbol_change": true,
+        "save_image": false,
+        "calendar": false,
+        "details": false,
+        "hotlist": false,
+        "studies": ["RSI@tv-basicstudies", "MASimple@tv-basicstudies"],
         "withdateranges": true,
-        "allow_symbol_change": false,
-        "container_id": "tv_{symbol.replace(':','_')}",
-        "height": {height}
+        "support_host": "https://www.tradingview.com"
       }});
     </script>
   </div>
 </div>
 """
+    st.components.v1.html(html, height=height + 40, scrolling=False)
 
 
-# ----------------------------
-# Sidebar (settings & capital)
-# ----------------------------
-st.markdown(f"# {APP_TITLE}")
-st.markdown(f"<div class='small-muted'>{APP_SUBTITLE}</div>", unsafe_allow_html=True)
-st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
+# =========================
+# Auto refresh (NO external module)
+# =========================
+def meta_refresh(seconds: int) -> None:
+    # Works as full page refresh; lightweight and no extra packages.
+    if seconds <= 0:
+        return
+    st.markdown(
+        f"""<meta http-equiv="refresh" content="{int(seconds)}">""",
+        unsafe_allow_html=True,
+    )
 
-with st.sidebar:
-    st.markdown("### ⚙️ Settings")
 
-    auto = st.toggle("Auto refresh", value=True)
-    refresh_min = st.slider("Refresh interval (min)", 1, 30, 2)
-    inject_auto_refresh(auto, int(refresh_min * 60))
+# =========================
+# Header
+# =========================
+st.markdown(
+    """
+<div class="ufx-header">
+  <div>
+    <div class="ufx-title">🚀 UnknownFX Dashboard</div>
+    <div class="ufx-sub">Institutional view · Capital.com candles · TradingView charts · EPIC mapping · Public/Private mode</div>
+  </div>
+  <div class="ufx-badge">PRO+++</div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
 
-    tv_interval = st.selectbox("TradingView interval (chart)", options=["1", "5", "15", "60", "240", "1D"], index=2)
+st.write("")
 
-    st.markdown("---")
-    st.markdown("### 🔑 Capital.com (required voor candles & indicators)")
 
-    ok, missing = required_capital_secrets_present()
-    if not ok:
-        st.error("Missing secrets:\n\n- " + "\n- ".join(missing))
-        st.info("Ga naar Streamlit Cloud → App → Settings → Secrets en zet ze in TOML formaat.")
-    else:
-        colA, colB = st.columns(2)
-        with colA:
-            if st.button("Login / Refresh", use_container_width=True):
-                success, msg = capital_login(force=True)
-                (st.success(msg) if success else st.error(msg))
-        with colB:
-            if st.button("Clear session", use_container_width=True):
-                st.session_state.pop("capital_token", None)
-                st.success("Session cleared.")
-
-        # Attempt a safe reuse (no force)
-        success, msg = capital_login(force=False)
-        if success:
-            st.success("Capital login OK ✅")
-        else:
-            st.warning(msg)
-
-    st.markdown("---")
-    st.markdown("### 🧭 EPIC map (1x instellen)")
-    st.caption("Plak jouw EPICs hier (van Capital). Je zei dat je ze al hebt gevonden via 'Use this EPIC'.")
-
-    # --- EPIC storage persistent ---
-import json, os
-
-EPIC_FILE = "epics.json"
-
-def load_epics():
-    if os.path.exists(EPIC_FILE):
-        with open(EPIC_FILE, "r") as f:
-            return json.load(f)
-    return {}
-
-def save_epics(data):
-    with open(EPIC_FILE, "w") as f:
-        json.dump(data, f)
-
+# =========================
+# Load EPICs (persisted)
+# =========================
 if "epics" not in st.session_state:
     st.session_state["epics"] = load_epics()
 
-for m in MARKETS:
-    val = st.text_input(
-        f"{m.key} EPIC",
-        value=st.session_state["epics"].get(m.key, ""),
-        placeholder=m.default_epic_hint,
-        key=f"epic_{m.key}"
-    )
-    st.session_state["epics"][m.key] = val
+# =========================
+# Sidebar (ADMIN ONLY)
+# =========================
+if ADMIN:
+    with st.sidebar:
+        st.markdown("## ⚙️ Settings")
 
-save_epics(st.session_state["epics"])
+        auto_refresh_on = st.toggle("Auto refresh", value=True)
+        refresh_min = st.slider("Refresh interval (min)", 1, 30, 10, 1)
+        chart_tf = st.selectbox("TradingView interval (chart)", list(TV_INTERVALS.keys()), index=2)  # 15m default
 
-st.markdown("---")
-st.caption("Tip: als je 429 krijgt → je logt te vaak in. Wacht 1–2 min en klik 1x op Login/Refresh.")
+        st.markdown("---")
+        st.markdown("## 🔑 Capital.com (required)")
 
-
-# ----------------------------
-# Main content
-# ----------------------------
-# Market selector
-market_key = st.selectbox("Select market", options=[m.key for m in MARKETS], index=0)
-market = next(m for m in MARKETS if m.key == market_key)
-epic = st.session_state.get("epics", {}).get(market.key, "").strip()
-
-# Top row: Overview cards
-left, mid, right = st.columns([1.2, 1.2, 1.6], gap="large")
-
-with left:
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown(f"<div class='card-title'>Market</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='card-big'>{market.key}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='card-sub'>{market.label} • {market.asset_class}</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with mid:
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown("<div class='card-title'>TradingView Symbol</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='card-big'>{market.tv_symbol}</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='card-sub'>Interval: {tv_interval}</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with right:
-    st.markdown("<div class='card'>", unsafe_allow_html=True)
-    st.markdown("<div class='card-title'>Capital EPIC</div>", unsafe_allow_html=True)
-    st.markdown(f"<div class='card-big'>{epic if epic else '—'}</div>", unsafe_allow_html=True)
-    if not epic:
-        st.markdown("<div class='card-sub'>Vul EPIC in via sidebar → EPIC map</div>", unsafe_allow_html=True)
-    else:
-        st.markdown("<div class='card-sub'>Wordt gebruikt voor candles/indicators</div>", unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
-
-# Capital candles + indicators (safe)
-capital_ok, cap_headers, cap_msg = capital_headers()
-base = (st.session_state.get("capital_token", {}) or {}).get("base") or (get_secret("CAPITAL_API_BASE") or "").rstrip("/")
-
-ind_col, mtf_col = st.columns([1.4, 1.0], gap="large")
-
-with ind_col:
-    st.subheader("📌 Capital.com Snapshot (candles → indicators)")
-    if not capital_ok:
-        st.warning(cap_msg)
-    elif not epic:
-        st.info("Geen EPIC ingevuld. Vul EPIC in (sidebar) om candles & indicators te zien.")
-    else:
-        try:
-            df = capital_get_prices(base, cap_headers, epic, CAPITAL_RESOLUTION_MAP.get(tv_interval, "MINUTE_15"), max_points=250)
-            if df.empty or len(df) < 60:
-                st.warning("Te weinig candle data ontvangen voor goede indicators. Probeer andere interval of check EPIC.")
-            else:
-                info = bias_from_indicators(df)
-                label, badge_cls = score_to_label(info["score"])
-
-                c1, c2, c3, c4 = st.columns(4)
-                c1.markdown(f"<div class='card'><div class='card-title'>Price</div><div class='card-big'>{info['close']:.2f}</div></div>", unsafe_allow_html=True)
-                c2.markdown(f"<div class='card'><div class='card-title'>RSI(14)</div><div class='card-big'>{info['rsi']:.1f}</div></div>", unsafe_allow_html=True)
-                c3.markdown(f"<div class='card'><div class='card-title'>SMA20 / SMA50</div><div class='card-big'>{info['sma20']:.2f} / {info['sma50']:.2f}</div></div>", unsafe_allow_html=True)
-                c4.markdown(f"<div class='card'><div class='card-title'>Volatility (ATR%)</div><div class='card-big'>{info['atr_pct']:.2f}%</div></div>", unsafe_allow_html=True)
-
-                st.markdown(
-                    f"<div class='{badge_cls}'>{label}</div>",
-                    unsafe_allow_html=True,
-                )
-                st.caption("Bias score is een simpele institutional-style rule-set op SMA/RSI/structure. Geen financieel advies.")
-        except requests.HTTPError as e:
-            st.error(f"Capital request failed: {e}")
-        except Exception as e:
-            st.error(f"Unexpected error: {e}")
-
-with mtf_col:
-    st.subheader("🧠 MTF Confluence (15m → 1D)")
-    if not capital_ok:
-        st.warning("Login eerst op Capital.")
-    elif not epic:
-        st.info("Vul EPIC in voor MTF.")
-    else:
-        intervals = [("15", "15m"), ("60", "1H"), ("240", "4H"), ("1D", "1D")]
-        scores = {}
-        lines = []
-        for iv, label_iv in intervals:
-            try:
-                df_iv = capital_get_prices(base, cap_headers, epic, CAPITAL_RESOLUTION_MAP[iv], max_points=250)
-                if df_iv.empty or len(df_iv) < 60:
-                    lines.append(f"- {label_iv}: onvoldoende data")
-                    continue
-                info_iv = bias_from_indicators(df_iv)
-                scores[iv] = info_iv["score"]
-                lbl, _ = score_to_label(info_iv["score"])
-                lines.append(f"- {label_iv}: **{lbl}** (RSI {info_iv['rsi']:.1f})")
-            except Exception:
-                lines.append(f"- {label_iv}: error")
-
-        if scores:
-            verdict, cls = mtf_verdict(scores)
-            st.markdown(f"<div class='{cls}'>{verdict}</div>", unsafe_allow_html=True)
-        st.markdown("\n".join(lines))
-        st.caption("Rule of thumb: agressiever handelen als 3+ timeframes hetzelfde zeggen.")
-
-
-st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
-
-# TradingView big chart (1 per row)
-st.subheader("📈 TradingView Chart (groot)")
-st.components.v1.html(tradingview_advanced_chart(market.tv_symbol, tv_interval, height=700), height=740)
-
-st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
-
-# Watchlist section (all markets, 1 per row, quick view)
-st.subheader("🧾 Watchlist (Quick Outlook)")
-st.caption("Per market: TradingView chart + (als EPIC ingevuld) Capital bias.")
-
-for m in MARKETS:
-    ep = st.session_state.get("epics", {}).get(m.key, "").strip()
-    st.markdown(f"### {m.key} — {m.label}")
-    row_left, row_right = st.columns([1.6, 1.0], gap="large")
-
-    with row_left:
-        st.components.v1.html(tradingview_advanced_chart(m.tv_symbol, tv_interval, height=520), height=560)
-
-    with row_right:
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown("<div class='card-title'>Outlook</div>", unsafe_allow_html=True)
-
-        if not capital_ok:
-            st.markdown("<div class='card-sub'>Capital not logged in</div>", unsafe_allow_html=True)
-        elif not ep:
-            st.markdown("<div class='card-sub'>No EPIC set</div>", unsafe_allow_html=True)
-            st.caption("Zet EPIC in sidebar.")
+        ok, missing = capital_required_secrets_ok()
+        if not ok:
+            st.error(f"Missing secrets: {', '.join(missing)}")
         else:
-            try:
-                df_w = capital_get_prices(base, cap_headers, ep, CAPITAL_RESOLUTION_MAP.get(tv_interval, "MINUTE_15"), max_points=250)
-                if df_w.empty or len(df_w) < 60:
-                    st.markdown("<div class='card-sub'>Not enough data</div>", unsafe_allow_html=True)
-                else:
-                    info_w = bias_from_indicators(df_w)
-                    lbl, cls = score_to_label(info_w["score"])
-                    st.markdown(f"<div class='{cls}'>{lbl}</div>", unsafe_allow_html=True)
-                    st.markdown(
-                        f"<div class='card-sub'>Price: <b>{info_w['close']:.2f}</b><br>"
-                        f"RSI(14): <b>{info_w['rsi']:.1f}</b><br>"
-                        f"ATR%: <b>{info_w['atr_pct']:.2f}%</b></div>",
-                        unsafe_allow_html=True,
-                    )
-            except requests.HTTPError as e:
-                st.error(f"Capital error: {e}")
-            except Exception as e:
-                st.error(f"Error: {e}")
+            colA, colB = st.columns(2)
+            with colA:
+                if st.button("Login / Refresh", use_container_width=True):
+                    success, info = capital_login(force=True)
+                    if success:
+                        st.success("Capital login OK ✅")
+                    else:
+                        st.error(f"Capital login failed: {info}")
+            with colB:
+                if st.button("Clear session", use_container_width=True):
+                    st.session_state.pop("capital_token", None)
+                    st.session_state.pop("capital_login_cooldown_until", None)
+                    st.success("Session cleared.")
 
-        st.markdown("</div>", unsafe_allow_html=True)
+            # Show token status (minimal)
+            token = st.session_state.get("capital_token")
+            if token:
+                age = int(time.time() - float(token.get("ts", 0)))
+                st.caption(f"Session active · age {age}s · base: {token.get('base','')}")
+            else:
+                st.caption("No active session yet.")
 
-    st.markdown("<div class='hr'></div>", unsafe_allow_html=True)
+        st.markdown("---")
+        st.markdown("## 🧭 EPIC map (1x instellen)")
+        st.caption("Plak jouw EPICs hier (van Capital). Je hebt ze gevonden via 'Use this EPIC'.")
 
-st.caption("© UnknownFX • Built with Streamlit • Data: TradingView embeds + Capital.com API")
+        for m in MARKETS:
+            val = st.text_input(
+                f"{m.key} EPIC",
+                value=st.session_state["epics"].get(m.key, ""),
+                placeholder=m.epic_hint,
+                key=f"epic_{m.key}",
+            )
+            st.session_state["epics"][m.key] = val.strip()
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Save EPICs", use_container_width=True):
+                save_epics(st.session_state["epics"])
+                st.success("EPICs saved ✅")
+        with c2:
+            if st.button("Clear EPICs", use_container_width=True):
+                st.session_state["epics"] = {m.key: "" for m in MARKETS}
+                save_epics(st.session_state["epics"])
+                st.warning("EPICs cleared.")
+
+        st.caption("Tip: krijg je 429 → je logt te vaak in. Zet refresh hoger (10+ min).")
+
+
+# =========================
+# Public mode defaults (no sidebar)
+# =========================
+if not ADMIN:
+    # Public visitors: fixed defaults
+    auto_refresh_on = True
+    refresh_min = 10
+    chart_tf = "15m"
+
+
+# Apply refresh
+if auto_refresh_on:
+    meta_refresh(refresh_min * 60)
+
+
+# =========================
+# Main controls
+# =========================
+top_left, top_right = st.columns([2.2, 1.0], vertical_alignment="top")
+
+with top_left:
+    market_key = st.selectbox(
+        "Market",
+        options=[m.key for m in MARKETS],
+        format_func=lambda k: next(x.label for x in MARKETS if x.key == k),
+        index=0,
+        label_visibility="collapsed",
+    )
+
+with top_right:
+    tf = st.selectbox("Timeframe", options=list(TV_INTERVALS.keys()), index=list(TV_INTERVALS.keys()).index(chart_tf))
+    st.caption("Capital candles volgen dezelfde timeframe waar mogelijk.")
+
+
+market = next(m for m in MARKETS if m.key == market_key)
+epic = (st.session_state.get("epics", {}) or {}).get(market.key, "").strip()
+tv_interval = TV_INTERVALS.get(tf, "15")
+cap_tf = tf if tf in CAP_RES else "15m"
+
+
+# =========================
+# Data fetch + KPI cards
+# =========================
+kpi1, kpi2, kpi3, kpi4 = st.columns([1.1, 1.1, 1.1, 1.7], gap="large")
+
+price_text = "—"
+chg_text = "—"
+rsi_text = "—"
+atr_text = "—"
+status_text = ""
+
+df = None
+
+if epic:
+    ok, out = fetch_candles(epic=epic, timeframe_key=cap_tf, max_points=300)
+    if ok:
+        df = out
+        last = float(df["close"].iloc[-1])
+        prev = float(df["close"].iloc[-2]) if len(df) > 1 else last
+        chg = ((last - prev) / prev) * 100 if prev else 0.0
+        rsi = compute_rsi(df["close"], 14)
+        atrp = compute_atr_pct(df, 14)
+
+        price_text = f"{last:,.2f}"
+        chg_text = f"{chg:+.2f}%"
+        rsi_text = f"{rsi:.1f}" if pd.notna(rsi) else "—"
+        atr_text = f"{atrp:.2f}%" if pd.notna(atrp) else "—"
+        status_text = "Capital candles: OK ✅"
+    else:
+        status_text = f"Capital candles: ERROR — {out}"
+else:
+    status_text = "EPIC ontbreekt voor deze market (admin: vul EPIC map in)."
+
+with kpi1:
+    st.markdown('<div class="card"><div class="card-title">Price (Capital)</div>'
+                f'<div class="card-value">{price_text}</div>'
+                f'<div class="card-sub">{market.label}</div></div>', unsafe_allow_html=True)
+
+with kpi2:
+    st.markdown('<div class="card"><div class="card-title">Change</div>'
+                f'<div class="card-value">{chg_text}</div>'
+                f'<div class="card-sub">Last candle vs prev</div></div>', unsafe_allow_html=True)
+
+with kpi3:
+    st.markdown('<div class="card"><div class="card-title">RSI (14)</div>'
+                f'<div class="card-value">{rsi_text}</div>'
+                f'<div class="card-sub">Momentum</div></div>', unsafe_allow_html=True)
+
+with kpi4:
+    st.markdown('<div class="card"><div class="card-title">Volatility (ATR%)</div>'
+                f'<div class="card-value">{atr_text}</div>'
+                f'<div class="card-sub">{status_text}</div></div>', unsafe_allow_html=True)
+
+st.write("")
+
+
+# =========================
+# Big Chart (TradingView) — BIGGER
+# =========================
+tradingview_embed(symbol=market.tv_symbol, interval=tv_interval, height=820)
+
+
+# =========================
+# Optional: show candles table (ADMIN only)
+# =========================
+if ADMIN:
+    with st.expander("Debug · Capital candles dataframe", expanded=False):
+        if df is None:
+            st.warning("No DF available (missing epic or error).")
+        else:
+            st.dataframe(df.tail(50), use_container_width=True)
+
+
+# =========================
+# Footer note
+# =========================
+st.caption(
+    "Public mode: sidebar hidden. Admin mode: open with `?admin=1` and login (ADMIN_PASSWORD). "
+    "EPICs are stored in epics.json + session_state."
+)

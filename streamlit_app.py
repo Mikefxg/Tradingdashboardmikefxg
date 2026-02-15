@@ -709,3 +709,46 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+import requests
+
+def capital_login(base: str, api_key: str, identifier: str, password: str, timeout=15):
+    """
+    Returns: (ok: bool, data: dict)
+    On success: data has 'cst' and 'x_security_token' + json body
+    """
+    base = base.rstrip("/")
+    url = f"{base}/api/v1/session"
+
+    headers = {
+        "X-CAP-API-KEY": api_key,          # <- BELANGRIJK: exact deze header
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    payload = {
+        "identifier": identifier,
+        "password": password,
+        "encryptedPassword": False,
+    }
+
+    r = requests.post(url, headers=headers, json=payload, timeout=timeout)
+
+    # Capital tokens zitten vaak in headers
+    cst = r.headers.get("CST")
+    xst = r.headers.get("X-SECURITY-TOKEN")
+
+    try:
+        body = r.json()
+    except Exception:
+        body = {"raw": r.text}
+
+    if r.status_code >= 200 and r.status_code < 300 and cst and xst:
+        return True, {"status": r.status_code, "body": body, "cst": cst, "x_security_token": xst}
+    else:
+        return False, {
+            "status": r.status_code,
+            "body": body,
+            "got_CST": bool(cst),
+            "got_X_SECURITY_TOKEN": bool(xst),
+            "resp_headers_keys": list(r.headers.keys()),
+        

@@ -744,12 +744,11 @@ def capital_login(base: str, api_key: str, identifier: str, password: str, timeo
 
     if r.status_code >= 200 and r.status_code < 300 and cst and xst:
         return True, {"status": r.status_code, "body": body, "cst": cst, "x_security_token": xst}
-    else:
-        return False, {
-            "status": r.status_code,
-            "body": body,
-            "got_CST": bool(cst),
-            "got_X_SECURITY_TOKEN": bool(xst),
-            "resp_headers_keys": list(r.headers.keys()),
-            {
-        
+   else:
+    return False, {
+        "status": r.status_code,
+        "body": body,
+        "got_CST": bool(cst),
+        "got_X_SECURITY_TOKEN": bool(xst),
+        "resp_headers_keys": list(r.headers.keys()),
+    }

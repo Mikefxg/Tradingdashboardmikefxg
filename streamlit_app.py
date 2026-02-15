@@ -751,4 +751,5 @@ def capital_login(base: str, api_key: str, identifier: str, password: str, timeo
             "got_CST": bool(cst),
             "got_X_SECURITY_TOKEN": bool(xst),
             "resp_headers_keys": list(r.headers.keys()),
+            {
         

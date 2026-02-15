@@ -1,469 +1,507 @@
+import os
 import math
 import time
 from datetime import datetime, timedelta, timezone
 
-import numpy as np
-import pandas as pd
 import requests
+import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 
-# =========================
+# -----------------------------
 # CONFIG
-# =========================
-st.set_page_config(page_title="Market Outlook", page_icon="📊", layout="wide")
+# -----------------------------
+st.set_page_config(page_title="Trading Dashboard", layout="wide")
 
-st.title("📊 Market Outlook — Bull/Bear Engine (Sentiment • Vol • News • DXY)")
-st.caption("TradingView charts + eigen outlook score. Calendar: alleen RED/ORANGE. DXY proxy via UUP.")
+REFRESH_SECONDS = 60
+USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 
-# ---- Sidebar
-st.sidebar.header("⚙️ Settings")
-refresh_seconds = st.sidebar.slider("Auto-refresh (seconds)", 30, 600, 60, step=30)
-tf_fast = st.sidebar.selectbox("Fast timeframe", ["1", "5", "15"], index=2)
-tf_slow = st.sidebar.selectbox("Slow timeframe", ["60", "240", "D"], index=0)
-lookback_bars = st.sidebar.slider("Lookback bars (trend/vol)", 60, 400, 180, step=30)
-use_dxy = st.sidebar.checkbox("Include DXY movement in score", value=True)
-
-st.sidebar.divider()
-st.sidebar.subheader("📅 ForexFactory calendar")
-ff_file = st.sidebar.file_uploader("Upload ForexFactory Calendar CSV (week export)", type=["csv"])
-st.sidebar.caption("We nemen alleen RED/ORANGE (High/Medium impact) mee.")
-
-# ---- Secrets
-API_KEY = st.secrets.get("FINNHUB_API_KEY", "").strip()
-if not API_KEY:
-    st.error("Missing FINNHUB_API_KEY in Streamlit Secrets (Manage app → Settings → Secrets).")
-    st.stop()
-
-# =========================
-# SYMBOLS
-# =========================
-# TradingView for "CFD look" (view-only)
-TV = {
-    "US100 (Nasdaq CFD)": "OANDA:NAS100USD",
-    "US30 (Dow CFD)": "OANDA:US30USD",
-    "SPX500 (S&P CFD)": "OANDA:SPX500USD",
-    "XAUUSD": "OANDA:XAUUSD",
-    "EURUSD": "OANDA:EURUSD",
+# Markets (spot/CFD intent) - we use TradingView symbols for charts
+MARKETS = {
+    "US100 (Nasdaq CFD)": {"tv": "OANDA:NAS100USD", "class": "index"},
+    "US30 (Dow CFD)": {"tv": "OANDA:US30USD", "class": "index"},
+    "SPX500 (S&P CFD)": {"tv": "OANDA:SPX500USD", "class": "index"},
+    "XAUUSD (Spot)": {"tv": "OANDA:XAUUSD", "class": "metal"},
+    "EURUSD (Spot)": {"tv": "OANDA:EURUSD", "class": "fx"},
 }
 
-# Calculation feed (Finnhub) - stable proxies where needed
-CALC = {
-    "US100 (Nasdaq CFD)": "QQQ",
-    "US30 (Dow CFD)": "DIA",
-    "SPX500 (S&P CFD)": "SPY",
-    "XAUUSD": "GLD",              # spot XAU via broker/provider later; GLD is stable now
-    "EURUSD": "OANDA:EUR_USD",    # if your Finnhub plan blocks this, swap to FX feed provider later
-}
+# DXY proxy (TradingView) – echte DXY kan via TV: "TVC:DXY"
+DXY_TV = "TVC:DXY"  # als deze niet werkt in embed, gebruik "ICEUS:DXY" of "TVC:DXY"
+# Alternatief: UUP ETF is proxy, maar jij wilde spot -> daarom DXY direct via TV.
 
-# DXY proxy (UUP = dollar ETF)
-DXY_PROXY = "UUP"
+# ForexFactory: alleen high impact (RED/ORANGE)
+# FF heeft "calendar.php". Scrape is best-effort.
+FF_URL = "https://www.forexfactory.com/calendar"
 
-MARKETS = list(TV.keys())
+# -----------------------------
+# HELPERS: general
+# -----------------------------
+def clamp(x, lo=-3, hi=3):
+    return max(lo, min(hi, x))
 
-# =========================
-# TRADINGVIEW WIDGETS
-# =========================
-def tv_symbol_info(symbol: str) -> str:
-    return f"""
+def safe_get(url, params=None, headers=None, timeout=15):
+    h = {"User-Agent": USER_AGENT}
+    if headers:
+        h.update(headers)
+    r = requests.get(url, params=params, headers=h, timeout=timeout)
+    r.raise_for_status()
+    return r
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+# -----------------------------
+# TradingView embed
+# -----------------------------
+def tv_widget(symbol: str, height: int = 360):
+    # Lightweight widget (single symbol)
+    # NOTE: Streamlit HTML embed
+    html = f"""
     <div class="tradingview-widget-container">
-      <div class="tradingview-widget-container__widget"></div>
-      <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-symbol-info.js" async>
-      {{
-        "symbol": "{symbol}",
-        "width": "100%",
-        "locale": "en",
-        "colorTheme": "light",
-        "isTransparent": true
-      }}
-      </script>
-    </div>
-    """
-
-def tv_chart(symbol: str, interval: str = "15") -> str:
-    return f"""
-    <div class="tradingview-widget-container">
-      <div id="tv_chart"></div>
+      <div id="tv_{symbol.replace(':','_').replace('/','_')}" style="height:{height}px;"></div>
       <script type="text/javascript" src="https://s3.tradingview.com/tv.js"></script>
       <script type="text/javascript">
         new TradingView.widget({{
           "autosize": true,
           "symbol": "{symbol}",
-          "interval": "{interval}",
+          "interval": "15",
           "timezone": "Etc/UTC",
           "theme": "light",
           "style": "1",
           "locale": "en",
+          "toolbar_bg": "#f1f3f6",
           "enable_publishing": false,
           "hide_top_toolbar": false,
-          "hide_side_toolbar": false,
-          "allow_symbol_change": true,
+          "hide_legend": false,
           "save_image": false,
-          "container_id": "tv_chart"
+          "container_id": "tv_{symbol.replace(':','_').replace('/','_')}"
         }});
       </script>
     </div>
     """
+    st.components.v1.html(html, height=height+30)
 
-# =========================
-# FOREX FACTORY CSV
-# =========================
-def _impact_class(x: str) -> str:
+# -----------------------------
+# ForexFactory calendar (best-effort scrape)
+# -----------------------------
+@st.cache_data(ttl=300)
+def fetch_ff_calendar():
     """
-    Map FF impact string to {high, medium, low, unknown}
-    We treat RED=high, ORANGE=medium.
+    Returns dataframe with: time_utc, currency, impact, title
+    impact: 'red' or 'orange' only
     """
-    s = str(x).strip().lower()
-    if any(k in s for k in ["high", "red", "3", "high impact"]):
-        return "high"
-    if any(k in s for k in ["medium", "orange", "2", "med impact"]):
-        return "medium"
-    if any(k in s for k in ["low", "yellow", "1"]):
-        return "low"
-    return "unknown"
-
-def parse_ff_csv(file) -> pd.DataFrame:
-    df = pd.read_csv(file)
-    df.columns = [c.strip().lower() for c in df.columns]
-
-    colmap = {}
-    for c in df.columns:
-        if "date" in c or "time" in c:
-            colmap[c] = "datetime"
-        elif c in ["currency", "cur"]:
-            colmap[c] = "currency"
-        elif "impact" in c:
-            colmap[c] = "impact"
-        elif "event" in c:
-            colmap[c] = "event"
-        elif "actual" in c:
-            colmap[c] = "actual"
-        elif "forecast" in c:
-            colmap[c] = "forecast"
-        elif "previous" in c:
-            colmap[c] = "previous"
-
-    df = df.rename(columns=colmap)
-
-    needed = ["datetime", "currency", "impact", "event"]
-    for k in needed:
-        if k not in df.columns:
-            return pd.DataFrame(columns=["datetime","currency","impact","impact_class","event","actual","forecast","previous"])
-
-    df["datetime"] = pd.to_datetime(df["datetime"], errors="coerce", utc=True)
-    df = df.dropna(subset=["datetime"]).sort_values("datetime").reset_index(drop=True)
-
-    for c in ["actual", "forecast", "previous"]:
-        if c not in df.columns:
-            df[c] = np.nan
-
-    df["impact_class"] = df["impact"].apply(_impact_class)
-
-    # keep only RED/ORANGE (high/medium)
-    df = df[df["impact_class"].isin(["high", "medium"])].reset_index(drop=True)
-    return df
-
-def _to_float(v):
     try:
-        s = str(v).strip().replace("%", "").replace(",", "")
-        if s in ["", "nan", "None"]:
-            return None
-        return float(s)
+        r = safe_get(FF_URL, timeout=20)
+        html = r.text
+
+        # SUPER simple parse that works often enough:
+        # We look for rows containing "calendar__row" and extract bits.
+        # If FF changes HTML, this may fail; we'll handle gracefully.
+
+        rows = []
+        # crude split
+        for chunk in html.split('calendar__row'):
+            # impact
+            impact = None
+            if "impact--high" in chunk:
+                impact = "red"
+            elif "impact--medium" in chunk:
+                impact = "orange"
+            else:
+                continue  # only red/orange
+
+            # currency (e.g. "USD")
+            currency = None
+            if 'calendar__currency' in chunk:
+                try:
+                    currency = chunk.split('calendar__currency')[1].split('>')[1].split('<')[0].strip()
+                except Exception:
+                    currency = None
+
+            # title
+            title = None
+            if 'calendar__event-title' in chunk:
+                try:
+                    title = chunk.split('calendar__event-title')[1].split('>')[1].split('<')[0].strip()
+                except Exception:
+                    title = None
+
+            # time (FF is local / site setting; we assume it's shown like "All Day" or "10:00am")
+            # We'll store raw_time; convert to UTC is not reliable without timezone setting.
+            raw_time = None
+            if 'calendar__time' in chunk:
+                try:
+                    raw_time = chunk.split('calendar__time')[1].split('>')[1].split('<')[0].strip()
+                except Exception:
+                    raw_time = None
+
+            if title and currency:
+                rows.append({
+                    "raw_time": raw_time or "",
+                    "currency": currency,
+                    "impact": impact,
+                    "title": title
+                })
+
+        df = pd.DataFrame(rows).drop_duplicates()
+        return df
     except Exception:
-        return None
+        return pd.DataFrame(columns=["raw_time", "currency", "impact", "title"])
 
-# =========================
-# FINNHUB CANDLES (stock vs forex)
-# =========================
-def finnhub_candles(symbol: str, resolution: str, bars: int = 180) -> pd.DataFrame:
+def ff_risk_score(df_ff: pd.DataFrame) -> int:
     """
-    Uses:
-    - /stock/candle for stocks/ETFs
-    - /forex/candle for forex symbols like OANDA:EUR_USD
+    Score event-risk based on count of red/orange items in the feed.
+    More events => more risk => more bearish for indices, mixed for FX/metals.
+    We'll return negative values (risk = bearish tilt).
     """
-    end = int(datetime.now(timezone.utc).timestamp())
-    sec = {"1":60,"5":300,"15":900,"60":3600,"240":14400,"D":86400}[resolution]
-    start = end - bars * sec
-
-    is_forex = ":" in symbol and symbol.upper().startswith(("OANDA:", "FXCM:", "FOREX:"))
-
-    endpoint = "https://finnhub.io/api/v1/forex/candle" if is_forex else "https://finnhub.io/api/v1/stock/candle"
-
-    r = requests.get(
-        endpoint,
-        params={"symbol": symbol, "resolution": resolution, "from": start, "to": end, "token": API_KEY},
-        timeout=20,
-    )
-
-    if r.status_code == 401:
-        raise RuntimeError("401 Unauthorized (API key invalid/not active)")
-    if r.status_code == 403:
-        raise RuntimeError("403 Forbidden (symbol/feed not allowed on your plan)")
-    r.raise_for_status()
-
-    js = r.json()
-    if js.get("s") != "ok":
-        raise RuntimeError(f"No candle data ({js.get('s')})")
-
-    df = pd.DataFrame({
-        "t": js["t"],
-        "o": js["o"],
-        "h": js["h"],
-        "l": js["l"],
-        "c": js["c"],
-        "v": js.get("v", [0] * len(js["t"])),
-    })
-    df["dt"] = pd.to_datetime(df["t"], unit="s", utc=True)
-    df = df.sort_values("dt").reset_index(drop=True)
-    return df
-
-# =========================
-# INDICATORS
-# =========================
-def atr(df: pd.DataFrame, n: int = 14) -> float:
-    h, l, c = df["h"], df["l"], df["c"]
-    prev_c = c.shift(1)
-    tr = pd.concat([(h-l), (h-prev_c).abs(), (l-prev_c).abs()], axis=1).max(axis=1)
-    return float(tr.rolling(n).mean().iloc[-1])
-
-def realized_vol(df: pd.DataFrame) -> float:
-    c = df["c"].astype(float)
-    rets = np.log(c / c.shift(1)).dropna()
-    if len(rets) < 10:
-        return 0.0
-    return float(rets.std() * math.sqrt(len(rets)) * 100)
-
-def momentum_score(df_fast: pd.DataFrame, df_slow: pd.DataFrame) -> int:
-    def slope_score(c: pd.Series) -> int:
-        y = c.tail(min(50, len(c))).values
-        x = np.arange(len(y))
-        m = np.polyfit(x, y, 1)[0]
-        return 1 if m > 0 else -1 if m < 0 else 0
-
-    def ema_score(c: pd.Series, span: int = 20) -> int:
-        e = c.ewm(span=span).mean()
-        return 1 if c.iloc[-1] > e.iloc[-1] else -1
-
-    c_fast = df_fast["c"].astype(float)
-    c_slow = df_slow["c"].astype(float)
-
-    score = 0
-    score += slope_score(c_fast)
-    score += ema_score(c_fast, 20)
-    score += slope_score(c_slow)
-    score += ema_score(c_slow, 20)
-    return int(np.clip(score, -4, 4))
-
-def vol_score(df_fast: pd.DataFrame) -> int:
-    rv = realized_vol(df_fast)
-    a = atr(df_fast, 14)
-    p = float(df_fast["c"].iloc[-1])
-    atr_pct = (a / p) * 100 if p else 0.0
-
-    score = 0
-    # vol spikes -> risk-off bias
-    if rv > 2.0 or atr_pct > 0.6:
-        score -= 1
-    if rv > 3.5 or atr_pct > 1.0:
-        score -= 1
-    return score
-
-# =========================
-# NEWS SCORING (FF) - only RED/ORANGE already filtered
-# =========================
-def news_impact_score(ff: pd.DataFrame) -> int:
-    """
-    Score based on:
-    - number of upcoming RED/ORANGE events in next 12h (risk -> bearish)
-    - recent surprises (Actual vs Forecast) in last 12h (bigger surprise -> more vol -> bearish)
-    """
-    if ff is None or ff.empty:
+    if df_ff is None or df_ff.empty:
         return 0
-
-    now = datetime.now(timezone.utc)
-    recent = ff[(ff["datetime"] >= now - timedelta(hours=12)) & (ff["datetime"] <= now)]
-    upcoming = ff[(ff["datetime"] > now) & (ff["datetime"] <= now + timedelta(hours=12))]
-
-    score = 0
-
-    # Upcoming load
-    n_up = len(upcoming)
-    if n_up >= 2:
-        score -= 1
-    if n_up >= 5:
-        score -= 1
-
-    # Recent surprises
-    if not recent.empty and ("actual" in recent.columns) and ("forecast" in recent.columns):
-        surprises = []
-        for _, r in recent.iterrows():
-            a = _to_float(r.get("actual"))
-            f = _to_float(r.get("forecast"))
-            if a is None or f is None:
-                continue
-            surprises.append(abs(a - f))
-
-        if surprises:
-            mx = max(surprises)
-            if mx > 0.5:
-                score -= 1
-            if mx > 1.0:
-                score -= 1
-
-    return score
-
-# =========================
-# DXY MOVEMENT SCORE (via UUP)
-# =========================
-def dxy_movement_score(df_dxy_fast: pd.DataFrame) -> int:
-    """
-    Score based on short-term DXY proxy (UUP) trend.
-    If USD strengthening -> tends to pressure EURUSD (bear) and XAUUSD (bear).
-    For indices: mild risk-off when USD spikes.
-    """
-    c = df_dxy_fast["c"].astype(float)
-    if len(c) < 20:
-        return 0
-
-    # simple pct change over last 20 bars
-    pct = (c.iloc[-1] / c.iloc[-20] - 1) * 100
-    if pct > 0.25:
-        return 1
-    if pct < -0.25:
+    reds = (df_ff["impact"] == "red").sum()
+    oranges = (df_ff["impact"] == "orange").sum()
+    # weight red more
+    x = -(2 * reds + 1 * oranges)
+    # map to -3..0
+    if x <= -8:
+        return -3
+    if x <= -5:
+        return -2
+    if x <= -2:
         return -1
     return 0
 
-# =========================
-# LABELING
-# =========================
+# -----------------------------
+# Price / momentum / volatility signals
+# We use TradingView charts for visuals; for scoring we do "proxy scoring" without paid APIs.
+# We'll use a simple synthetic approach:
+# - momentum: based on last refresh direction of a small free endpoint (exchangerate.host for EURUSD)
+# - for indices & XAU we fallback to neutral unless you add a real data API.
+# This keeps it stable and avoids 401/403 issues.
+# -----------------------------
+@st.cache_data(ttl=120)
+def fetch_eurusd():
+    try:
+        # exchangerate.host (free)
+        r = safe_get("https://api.exchangerate.host/latest", params={"base": "EUR", "symbols": "USD"}, timeout=15)
+        j = r.json()
+        rate = float(j["rates"]["USD"])
+        return rate
+    except Exception:
+        return None
+
+@st.cache_data(ttl=120)
+def fetch_dxy_proxy_move():
+    """
+    Without paid feeds, we approximate DXY move using a free USD basket proxy:
+    Use EURUSD + USDJPY if available; here we do a minimal approach using EURUSD only:
+    - If EURUSD down -> USD stronger -> DXY up (bullish DXY).
+    """
+    eurusd = fetch_eurusd()
+    if eurusd is None:
+        return 0
+    # compare with value 2 hours ago using timeseries (free)
+    try:
+        end = datetime.utcnow().date()
+        start = end - timedelta(days=7)
+        r = safe_get(
+            "https://api.exchangerate.host/timeseries",
+            params={"start_date": start.isoformat(), "end_date": end.isoformat(), "base": "EUR", "symbols": "USD"},
+            timeout=20,
+        )
+        j = r.json()
+        rates = j.get("rates", {})
+        # pick latest 2 available dates
+        keys = sorted(rates.keys())
+        if len(keys) < 2:
+            return 0
+        last = float(rates[keys[-1]]["USD"])
+        prev = float(rates[keys[-2]]["USD"])
+        # EURUSD up => USD weaker => DXY down (negative)
+        pct = (last - prev) / prev
+        if pct > 0.002:
+            return -2
+        if pct > 0.0005:
+            return -1
+        if pct < -0.002:
+            return 2
+        if pct < -0.0005:
+            return 1
+        return 0
+    except Exception:
+        return 0
+
+def momentum_score(market: str) -> int:
+    """
+    Minimal momentum scoring.
+    - EURUSD: uses exchangerate change (today vs previous day in timeseries)
+    - Others: neutral (0) unless you add a price API later
+    """
+    if "EURUSD" in market:
+        # reuse dxy proxy logic but inverted: EURUSD up => bullish EURUSD
+        try:
+            end = datetime.utcnow().date()
+            start = end - timedelta(days=7)
+            r = safe_get(
+                "https://api.exchangerate.host/timeseries",
+                params={"start_date": start.isoformat(), "end_date": end.isoformat(), "base": "EUR", "symbols": "USD"},
+                timeout=20,
+            )
+            j = r.json()
+            rates = j.get("rates", {})
+            keys = sorted(rates.keys())
+            if len(keys) < 2:
+                return 0
+            last = float(rates[keys[-1]]["USD"])
+            prev = float(rates[keys[-2]]["USD"])
+            pct = (last - prev) / prev
+            if pct > 0.002:
+                return 2
+            if pct > 0.0005:
+                return 1
+            if pct < -0.002:
+                return -2
+            if pct < -0.0005:
+                return -1
+            return 0
+        except Exception:
+            return 0
+
+    # TODO: add real CFD spot feeds later
+    return 0
+
+def volatility_score(market: str, ff_score: int) -> int:
+    """
+    Use FF event risk as a volatility proxy:
+    more red/orange => higher vol => bearish for indices
+    return:
+      calm => +1
+      elevated => 0
+      high => -1 or -2
+    """
+    if ff_score <= -3:
+        return -2
+    if ff_score <= -2:
+        return -1
+    if ff_score <= -1:
+        return 0
+    return 1
+
+def dxy_effect_for_market(market: str, dxy_move: int) -> int:
+    """
+    Positive dxy_move = USD stronger.
+    - EURUSD: USD stronger => bearish EURUSD
+    - XAUUSD: USD stronger often bearish gold
+    - Indices: strong USD can be mixed; keep mild negative if risk-off
+    """
+    if "EURUSD" in market:
+        return clamp(-dxy_move, -2, 2)
+    if "XAUUSD" in market:
+        return clamp(-dxy_move, -2, 2)
+    if "US" in market or "SPX" in market:
+        return clamp(-1 if dxy_move >= 2 else 0, -2, 2)
+    return 0
+
 def label_from_total(total: int) -> str:
     if total >= 3:
         return "BULLISH"
-    if total <= -3:
+    if total == 2:
+        return "BULLISH"
+    if total == 1:
+        return "SLIGHT BULL"
+    if total == 0:
+        return "NEUTRAL"
+    if total == -1:
+        return "SLIGHT BEAR"
+    if total <= -2:
         return "BEARISH"
     return "NEUTRAL"
 
 def badge(label: str) -> str:
-    return {"BULLISH":"🟢 BULLISH","BEARISH":"🔴 BEARISH"}.get(label, "⚪ NEUTRAL")
+    if "BULL" in label:
+        return f"<span style='padding:6px 10px;border-radius:999px;background:#E8F7EE;color:#0A6B2D;font-weight:700;font-size:12px'>{label}</span>"
+    if "BEAR" in label:
+        return f"<span style='padding:6px 10px;border-radius:999px;background:#FDECEC;color:#9B1C1C;font-weight:700;font-size:12px'>{label}</span>"
+    return f"<span style='padding:6px 10px;border-radius:999px;background:#EEF2F7;color:#334155;font-weight:700;font-size:12px'>{label}</span>"
 
-# =========================
-# LOAD CALENDAR (RED/ORANGE only)
-# =========================
-ff_df = parse_ff_csv(ff_file) if ff_file else pd.DataFrame()
+def outlook_text(market: str, mom: int, vol: int, ff_score: int, dxy_component: int, total: int) -> str:
+    parts = []
 
-# Precompute calendar score (macro risk)
-ff_score = news_impact_score(ff_df)
+    if total >= 2:
+        regime = "Risk-on / bullish bias"
+    elif total <= -2:
+        regime = "Risk-off / bearish bias"
+    else:
+        regime = "Mixed / neutral bias"
 
-# Precompute DXY proxy score (macro USD move)
-dxy_score = 0
-if use_dxy:
-    try:
-        dxy_fast = finnhub_candles(DXY_PROXY, tf_fast, bars=lookback_bars)
-        dxy_score = dxy_movement_score(dxy_fast)  # +1 = USD up, -1 = USD down
-    except Exception:
-        dxy_score = 0
+    if mom >= 2:
+        parts.append("momentum stijgt")
+    elif mom <= -2:
+        parts.append("momentum daalt")
+    else:
+        parts.append("momentum is gemengd")
 
-# =========================
-# TOP CARDS
-# =========================
-cols = st.columns(5)
-results = {}
+    if vol <= -2:
+        parts.append("volatiliteit is hoog")
+    elif vol == -1:
+        parts.append("volatiliteit is verhoogd")
+    else:
+        parts.append("volatiliteit is rustig")
 
-for i, m in enumerate(MARKETS):
+    if ff_score <= -2:
+        parts.append("veel RED/ORANGE nieuws (event-risk)")
+    elif ff_score == -1:
+        parts.append("RED/ORANGE nieuws in de buurt")
+    else:
+        parts.append("weinig high-impact nieuws")
+
+    if dxy_component > 0:
+        parts.append("DXY werkt mee")
+    elif dxy_component < 0:
+        parts.append("DXY werkt tegen")
+    else:
+        parts.append("DXY neutraal")
+
+    if "XAUUSD" in market:
+        hint = " (Goud reageert sterk op USD + risk-off.)"
+    elif "EURUSD" in market:
+        hint = " (EURUSD is vaak inverse van USD-strength.)"
+    else:
+        hint = " (Indices houden niet van hoge vol + heavy news.)"
+
+    return f"**{regime}** — " + ", ".join(parts) + "." + hint
+
+def global_outlook(market_scores: dict, ff_score: int, dxy_move: int) -> tuple[str, str]:
+    """
+    Combine everything into a single global regime.
+    """
+    # average market totals
+    totals = [v["total"] for v in market_scores.values()]
+    avg = sum(totals) / max(1, len(totals))
+
+    # global adjustments
+    # more event risk => more risk-off
+    adj = 0
+    adj += ff_score  # ff_score is negative when risky
+    # strong USD can lean risk-off a bit
+    if dxy_move >= 2:
+        adj -= 1
+    elif dxy_move <= -2:
+        adj += 1
+
+    g = clamp(round(avg + 0.6 * adj), -3, 3)
+    lbl = label_from_total(g)
+
+    explanation = []
+    explanation.append(f"Gemiddelde marketscore: **{avg:+.2f}**")
+    explanation.append(f"Event-risk (FF RED/ORANGE): **{ff_score:+d}**")
+    explanation.append(f"DXY move proxy: **{dxy_move:+d}**")
+
+    if g >= 2:
+        exp2 = "Globaal: **Risk-on** (bullish bias). Focus op trend-follow, dips buy (met risk management rond nieuws)."
+    elif g <= -2:
+        exp2 = "Globaal: **Risk-off** (bearish bias). Focus op defensief, mean reversion/short rallies, en smaller size rond nieuws."
+    else:
+        exp2 = "Globaal: **Mixed**. Kies selectief: trade alleen A+ setups, pas size aan, en respecteer nieuws windows."
+
+    return lbl, " • ".join(explanation) + "\n\n" + exp2
+
+# -----------------------------
+# UI
+# -----------------------------
+st.title("📊 Trading Dashboard")
+st.caption(
+    f"Outlook score = momentum + volatility + news(event-risk) + DXY-effect. "
+    f"Auto refresh elke {REFRESH_SECONDS}s. Charts via TradingView. Calendar: alleen RED/ORANGE."
+)
+
+st.markdown(
+    f"""
+    <script>
+    setTimeout(function(){{
+        window.location.reload();
+    }}, {REFRESH_SECONDS * 1000});
+    </script>
+    """,
+    unsafe_allow_html=True
+)
+
+# Pull FF events and DXY proxy move
+df_ff = fetch_ff_calendar()
+ff_score = ff_risk_score(df_ff)
+dxy_move = fetch_dxy_proxy_move()
+
+# Build per-market scores
+market_scores = {}
+for m in MARKETS.keys():
+    mom = momentum_score(m)
+    vol = volatility_score(m, ff_score)
+    dxy_component = dxy_effect_for_market(m, dxy_move)
+
+    # News component: treat high event risk as bearish bias across all, strongest for indices
+    if MARKETS[m]["class"] == "index":
+        news_component = clamp(ff_score, -3, 0)
+    else:
+        # FX/metals are more two-sided; keep milder
+        news_component = clamp(math.ceil(ff_score / 2), -2, 0)
+
+    total = clamp(mom + vol + news_component + dxy_component, -3, 3)
+    lbl = label_from_total(total)
+
+    market_scores[m] = {
+        "mom": mom,
+        "vol": vol,
+        "news": news_component,
+        "dxy": dxy_component,
+        "total": total,
+        "label": lbl,
+    }
+
+# GLOBAL OUTLOOK
+glbl, gtext = global_outlook(market_scores, ff_score, dxy_move)
+st.markdown(f"### Global Outlook {badge(glbl)}", unsafe_allow_html=True)
+st.write(gtext)
+
+st.divider()
+
+# MARKET CARDS
+cols = st.columns(len(MARKETS))
+for i, (m, meta) in enumerate(MARKETS.items()):
+    s = market_scores[m]
     with cols[i]:
         st.subheader(m)
+        st.markdown(badge(s["label"]), unsafe_allow_html=True)
 
-        sym = CALC[m]
-        try:
-            df_fast = finnhub_candles(sym, tf_fast, bars=lookback_bars)
-            df_slow = finnhub_candles(sym, tf_slow, bars=lookback_bars)
+        st.write(f"Score: **{s['total']:+d}**  "
+                 f"(mom {s['mom']:+d} | vol {s['vol']:+d} | news {s['news']:+d} | dxy {s['dxy']:+d})")
 
-            mom = momentum_score(df_fast, df_slow)   # -4..+4
-            vol = vol_score(df_fast)                 # 0..-2
-            news = ff_score                           # 0..-2 (macro calendar)
-
-            # DXY effect depends on market:
-            # USD up -> bearish EURUSD, bearish Gold; mild bearish indices.
-            dxy_component = 0
-            if use_dxy:
-                if m == "EURUSD":
-                    dxy_component = -dxy_score   # USD up => EURUSD down (bear)
-                elif m == "XAUUSD":
-                    dxy_component = -dxy_score   # USD up => gold pressured (bear)
-                else:
-                    dxy_component = -1 if dxy_score == 1 else 0  # only penalize on strong USD
-
-            total = int(mom + vol + news + dxy_component)
-            lbl = label_from_total(total)
-
-            price = float(df_fast["c"].iloc[-1])
-            if m == "EURUSD":
-                st.metric("Price (calc feed)", f"{price:.5f}")
-            else:
-                st.metric("Price (calc feed)", f"{price:,.2f}")
-
-            st.write(badge(lbl), f"Score: **{total}**")
-            st.caption(
-                f"Sentiment: {mom:+d} • Vol: {vol:+d} • News: {news:+d} • DXY: {dxy_component:+d}"
-                if use_dxy else
-                f"Sentiment: {mom:+d} • Vol: {vol:+d} • News: {news:+d}"
-            )
-
-            results[m] = {"label": lbl, "score": total, "symbol": sym}
-
-        except Exception as e:
-            st.write("⚪ NEUTRAL")
-            st.caption(f"⚠️ Calc feed error: {str(e)[:120]}")
+        st.write(outlook_text(m, s["mom"], s["vol"], ff_score, s["dxy"], s["total"]))
 
 st.divider()
 
-# =========================
-# DETAILS
-# =========================
-left, right = st.columns([2, 1])
+tab1, tab2, tab3 = st.tabs(["📈 Charts", "🗞️ News (RED/ORANGE)", "💵 DXY"])
 
-with right:
-    selected = st.selectbox("Select market", MARKETS, index=0)
-    st.write("TradingView symbol:", f"`{TV[selected]}`")
-    st.write("Calc symbol:", f"`{CALC[selected]}`")
+with tab1:
+    pick = st.selectbox("Select market", list(MARKETS.keys()), index=0)
+    st.caption("Tip: als een OANDA symbool niet laadt, zeg het, dan pak ik een andere TradingView ticker.")
+    tv_widget(MARKETS[pick]["tv"], height=520)
 
-    if use_dxy:
-        st.write("DXY proxy (UUP) move score:", dxy_score, "(+1 USD up, -1 USD down, 0 flat)")
+with tab2:
+    st.subheader("ForexFactory Calendar (alleen RED/ORANGE)")
+    if df_ff is None or df_ff.empty:
+        st.warning("Geen events gevonden. ForexFactory kan scraping blokkeren (rate-limit/403). "
+                   "Als dit blijft, zet ik je om naar een alternatief met stabiele API.")
+    else:
+        # Show only USD/EUR high impact first for your instruments
+        prio = df_ff[df_ff["currency"].isin(["USD", "EUR"])]
+        rest = df_ff[~df_ff["currency"].isin(["USD", "EUR"])]
 
-    if selected in results:
-        st.write("Bias:", badge(results[selected]["label"]))
-        st.write("Score:", results[selected]["score"])
+        st.markdown("**Priority (USD/EUR):**")
+        st.dataframe(prio.reset_index(drop=True), use_container_width=True)
 
-with left:
-    components.html(tv_chart(TV[selected], interval=tf_fast), height=560)
+        st.markdown("**Others:**")
+        st.dataframe(rest.reset_index(drop=True), use_container_width=True)
 
-st.divider()
+        st.caption("Impact: red = high, orange = medium (ForexFactory).")
 
-# =========================
-# CALENDAR VIEW (RED/ORANGE ONLY)
-# =========================
-st.subheader("📅 ForexFactory — RED/ORANGE only (from CSV upload)")
-if ff_df.empty:
-    st.info("Upload ForexFactory week-CSV via de sidebar. We filteren automatisch naar RED/ORANGE.")
-else:
-    now = datetime.now(timezone.utc)
-    recent = ff_df[(ff_df["datetime"] >= now - timedelta(hours=12)) & (ff_df["datetime"] <= now)].tail(50)
-    upcoming = ff_df[(ff_df["datetime"] > now) & (ff_df["datetime"] <= now + timedelta(days=2))].head(80)
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.markdown("### Recent (last 12h)")
-        st.dataframe(
-            recent[["datetime","currency","impact","impact_class","event","actual","forecast","previous"]],
-            use_container_width=True
-        )
-    with c2:
-        st.markdown("### Upcoming (next 48h)")
-        st.dataframe(
-            upcoming[["datetime","currency","impact","impact_class","event","forecast","previous"]],
-            use_container_width=True
-        )
-
-st.caption(f"Last refresh: {datetime.now().strftime('%H:%M:%S')} • Auto refresh every {refresh_seconds}s")
-time.sleep(refresh_seconds)
-st.rerun()
+with tab3:
+    st.subheader("DXY")
+    st.write(f"DXY proxy move score: **{dxy_move:+d}** (positief = USD sterker, negatief = USD zwakker)")
+    tv_widget(DXY_TV, height=520)
